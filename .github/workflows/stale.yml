@@ -1,0 +1,24 @@
+name: 'Close stale issues and PRs'
+on:
+  schedule:
+    - cron: '30 1 * * *'
+
+permissions:
+  contents: read # By default, only read.
+
+jobs:
+  stale:
+    permissions:
+      issues: write  # for actions/stale to close stale issues
+      pull-requests: write  # for actions/stale to close stale PRs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
+        with:
+          stale-issue-message: 'This issue has had no activity and is being marked as stale. If you still wish to continue with this issue please comment to reopen it.'
+          stale-pr-message: 'This pull request has had no activity and is being marked as stale. If you still wish to continue with this pull request please comment to reopen it.'
