@@ -1,0 +1,110 @@
+/************************************************************************************
+ *
+ * D++, A Lightweight C++ library for Discord
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright 2021 Craig Edwards and D++ contributors 
+ * (https://github.com/brainboxdotcc/DPP/graphs/contributors)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ ************************************************************************************/
+#include <dpp/discordevents.h>
+#include <dpp/cluster.h>
+#include <dpp/discordvoiceclient.h>
+#include <dpp/guild.h>
+#include <dpp/voicestate.h>
+#include <dpp/stringops.h>
+#include <dpp/json.h>
+
+
+
+namespace dpp::events {
+/**
+ * @brief Handle event
+ * 
+ * @param client Websocket client (current shard)
+ * @param j JSON data for the event
+ * @param raw Raw JSON string
+ */
+void voice_state_update::handle(discord_client* client, json &j, const std::string &raw) {
+
+	json& d = j["d"];
+	dpp::voice_state_update_t vsu(client->owner, client->shard_id, raw);
+	vsu.state = dpp::voicestate().fill_from_json(&d);
+	vsu.state.shard_id = client->shard_id;
+
+	/* Update guild voice states */
+	dpp::guild* g = dpp::find_guild(vsu.state.guild_id);
+	if (g) {
+		if (vsu.state.channel_id.empty()) {
+			auto ve = g->voice_members.find(vsu.state.user_id);
+			if (ve != g->voice_members.end()) {
+				g->voice_members.erase(ve);	
+			}
+		} else {
+			g->voice_members[vsu.state.user_id] = vsu.state;
+		}
+
+		if (client->creator->cache_policy.user_policy != dpp::cp_none) {
+			if (d.contains("member")) {
+				auto& member = d["member"];
+				guild_member m;
+				m.fill_from_json(&member, g->id, vsu.state.user_id);
+				g->members[m.user_id] = m;
+			}
+		}
+	}
+
+	if (vsu.state.user_id == client->creator->me.id) {
+		auto current_vc = client->get_voice(vsu.state.guild_id);
+		if (vsu.state.channel_id.empty()) {
+			/* Instruction to disconnect from vc */
+			client->disconnect_voice_internal(vsu.state.guild_id, false);
+		} else if (current_vc && vsu.state.channel_id != current_vc->channel_id) {
+			/* When there is a active vc and will be moved to a different channel (by user) */
+			/* Instruction to connect to a different channel */
+			std::shared_lock lock(client->voice_mutex);
+			auto v = client->connecting_voice_channels.find(vsu.state.guild_id);
+			if (v != client->connecting_voice_channels.end()) {
+				auto enable_dave = v->second->dave;
+				client->connecting_voice_channels.erase(v);
+				client->connecting_voice_channels[vsu.state.guild_id] = std::make_shared<voiceconn>(client,
+					[](discord_client* client) {
+						/* do nothing, discord will handle reconnection*/
+					}, vsu.state.guild_id, vsu.state.channel_id, enable_dave);
+				/* Should set the session_id here, did this ever work before without setting session_id?? */
+				client->connecting_voice_channels[vsu.state.guild_id]->session_id = vsu.state.session_id;
+			}
+		} else {
+			std::shared_lock lock(client->voice_mutex);
+			auto v = client->connecting_voice_channels.find(vsu.state.guild_id);
+			/* Check to see if we have a connection to a voice channel in progress on this guild */
+			if (v != client->connecting_voice_channels.end()) {
+				voiceconn& connection = *v->second;
+				connection.session_id = vsu.state.session_id;
+				if (connection.is_ready() && !connection.is_active()) {
+					connection.connect();
+				}
+			}
+		}
+	}
+
+	if (!client->creator->on_voice_state_update.empty()) {
+		client->creator->queue_work(1, [c = client->creator, vsu]() {
+			c->on_voice_state_update.call(vsu);
+		});
+	}
+}
+
+};
