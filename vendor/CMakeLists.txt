@@ -27,6 +27,16 @@ foreach(LIBRARY IN LISTS LIBRARIES)
 			cmake_path(GET LIBRARY FILENAME LIBRARY_NAME)
 			set(LIBRARY_TARGET "vendored_${LIBRARY_NAME}")
 			add_library(${LIBRARY_TARGET} STATIC ${LIBRARY_SOURCES})
+			if(LIBRARY_NAME STREQUAL "brainboxdotcc")
+				# DPP needs OpenSSL and zlib, and every consumer must see the same
+				# DPP_NO_CORO or the coroutine-gated members of dpp::cluster differ
+				# between the library and the module that uses it.
+				find_package(OpenSSL REQUIRED)
+				find_package(ZLIB REQUIRED)
+				target_compile_definitions(${LIBRARY_TARGET} PRIVATE DPP_BUILD PUBLIC DPP_NO_CORO)
+				target_include_directories(${LIBRARY_TARGET} PUBLIC ${Anope_SOURCE_DIR}/vendor/brainboxdotcc/dpp/include ${Anope_SOURCE_DIR}/vendor/brainboxdotcc/dpp/include/dpp)
+				target_link_libraries(${LIBRARY_TARGET} PRIVATE OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
+			endif()
 			target_compile_options(${LIBRARY_TARGET} PRIVATE "$<IF:$<BOOL:${MSVC}>,/W0,-w>")
 			set_target_properties(${LIBRARY_TARGET} PROPERTIES
 				FOLDER "VendoredLibraries"

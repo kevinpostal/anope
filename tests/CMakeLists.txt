@@ -8,3 +8,5 @@ function(anope_unit_test NAME)
 endfunction()
 
 anope_unit_test(test_bridgeserv_render bridgeserv/test_render.cpp)
+anope_unit_test(test_bridgeserv_relay bridgeserv/test_relay.cpp)
+anope_unit_test(test_bridgeserv_mailbox bridgeserv/test_mailbox.cpp)

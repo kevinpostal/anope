@@ -19,6 +19,7 @@
 
 #include "bridgeserv.h"
 #include "convert.h"
+#include "modules/bridgeserv/mailbox.h"
 #include "modules/bridgeserv/render.h"
 
 #include <dpp/dpp.h>
@@ -26,8 +27,6 @@
 #include <dpp/webhook.h>
 
 #include <algorithm>
-#include <ctime>
-#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -40,6 +39,9 @@
 namespace Text = BridgeServ::Text;
 
 class DiscordProtocol;
+
+/* Work handed from DPP's thread pool back to the main thread. */
+using Mailbox = BridgeServ::Async::Mailbox<DiscordProtocol>;
 
 /** Checks whether a string is usable as a Discord snowflake. */
 static bool ValidSnowflake(const Anope::string &value)
@@ -55,32 +57,35 @@ static bool ValidSnowflake(const Anope::string &value)
 	return Anope::TryConvert<uint64_t>(value).has_value();
 }
 
-/** State which is shared between Anope's main thread and DPP's thread pool.
+/** Removes the control characters from a configured string. */
+static std::string StripControl(const std::string &value)
+{
+	std::string out;
+	out.reserve(value.length());
+	for (const auto chr : value)
+	{
+		if (static_cast<unsigned char>(chr) >= 0x20)
+			out.push_back(chr);
+	}
+	return out;
+}
+
+/** What the Discord thread needs to know to discard traffic without waking
+ * the main thread.
  *
  * DPP dispatches gateway events and REST completions on its own thread pool
  * and cluster::shutdown() does not cancel work which is already in flight, so
  * a callback can fire at any point during (and after) module unload.
- * Callbacks therefore never capture the protocol; they capture a shared_ptr to
- * this object and hand work back to the main thread with Post(). The protocol
- * clears the owner in its destructor, after which a late callback is a no-op.
+ * Callbacks therefore never capture the protocol; they capture shared_ptrs
+ * to this filter and to the mailbox, and hand work back to the main thread
+ * with Mailbox::Post(). The protocol detaches the mailbox in its destructor,
+ * after which a late callback is a no-op.
  */
-class DiscordState final
+class DiscordFilter final
 {
-public:
-	using Job = std::function<void(DiscordProtocol *)>;
-
-private:
-	/* The maximum number of queued jobs before the oldest is dropped. */
-	static constexpr size_t MAX_JOBS = 4096;
-
 	std::mutex mutex;
-	DiscordProtocol *owner;
-	Pipe *pipe;
-	std::deque<Job> jobs;
-	size_t dropped = 0;
 
-	/* Discord channel ids which are bridged, so that the Discord thread can
-	 * discard traffic for other channels without waking the main thread. */
+	/* Discord channel ids which are bridged. */
 	std::unordered_set<std::string> bridged_channels;
 
 	/* Webhook ids which this module created or adopted, so that the Discord
@@ -92,56 +97,6 @@ private:
 	std::string own_user_id;
 
 public:
-	DiscordState(DiscordProtocol *protocol, Pipe *notifier)
-		: owner(protocol)
-		, pipe(notifier)
-	{
-	}
-
-	/** Queues a job to run on the main thread. Safe to call from any thread. */
-	void Post(Job job)
-	{
-		std::lock_guard<std::mutex> lock(this->mutex);
-		if (!this->owner || !this->pipe)
-			return;
-
-		if (this->jobs.size() >= MAX_JOBS)
-		{
-			this->jobs.pop_front();
-			++this->dropped;
-		}
-		this->jobs.push_back(std::move(job));
-		this->pipe->Notify();
-	}
-
-	/** Takes the next queued job, if there is one. */
-	bool PopJob(Job &job)
-	{
-		std::lock_guard<std::mutex> lock(this->mutex);
-		if (this->jobs.empty())
-			return false;
-
-		job = std::move(this->jobs.front());
-		this->jobs.pop_front();
-		return true;
-	}
-
-	/** Takes and resets the number of jobs dropped from the queue. */
-	size_t TakeDropped()
-	{
-		std::lock_guard<std::mutex> lock(this->mutex);
-		return std::exchange(this->dropped, 0);
-	}
-
-	/** Detaches the protocol; all later callbacks become no-ops. */
-	void Detach()
-	{
-		std::lock_guard<std::mutex> lock(this->mutex);
-		this->owner = nullptr;
-		this->pipe = nullptr;
-		this->jobs.clear();
-	}
-
 	bool IsBridged(const std::string &channel_id)
 	{
 		std::lock_guard<std::mutex> lock(this->mutex);
@@ -206,12 +161,12 @@ class DiscordThread final
 	: public Thread
 {
 	dpp::cluster *cluster;
-	std::shared_ptr<DiscordState> state;
+	std::shared_ptr<Mailbox> mailbox;
 
 public:
-	DiscordThread(dpp::cluster *c, std::shared_ptr<DiscordState> s)
+	DiscordThread(dpp::cluster *c, std::shared_ptr<Mailbox> m)
 		: cluster(c)
-		, state(std::move(s))
+		, mailbox(std::move(m))
 	{
 	}
 
@@ -224,7 +179,8 @@ class DiscordProtocol final
 {
 	dpp::cluster *cluster = nullptr;
 	DiscordThread *thread = nullptr;
-	std::shared_ptr<DiscordState> state;
+	std::shared_ptr<Mailbox> mailbox;
+	std::shared_ptr<DiscordFilter> filter;
 
 	Anope::string token;
 	Anope::string domain;
@@ -236,29 +192,6 @@ class DiscordProtocol final
 	/* ------------------------------------------------------------------ */
 	/* Rendering (called on the Discord thread; touches no Anope state)   */
 	/* ------------------------------------------------------------------ */
-
-	/** Formats a Discord timestamp token as a UTC time. */
-	static std::string FormatTimestamp(const std::string &value)
-	{
-		const auto when = Anope::TryConvert<time_t>(value);
-		if (!when.has_value())
-			return "";
-
-		const std::time_t raw = *when;
-		std::tm parts = { };
-#ifdef _WIN32
-		if (gmtime_s(&parts, &raw))
-			return "";
-#else
-		if (!gmtime_r(&raw, &parts))
-			return "";
-#endif
-
-		char buf[32];
-		if (!std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", &parts))
-			return "";
-		return buf;
-	}
 
 	/** Renders a Discord message as IRC-ready text. */
 	static Anope::string RenderMessage(const dpp::message &msg)
@@ -314,12 +247,17 @@ class DiscordProtocol final
 					return ":" + Text::EscapeMarkdown(name) + ":";
 
 				case 't':
-					return FormatTimestamp(id);
+					return Text::FormatUnixTime(id);
 			}
 			return "";
 		};
 
-		std::string text = Text::MarkdownToIrc(Text::ExpandTokens(msg.content, resolve));
+		const auto render = [&resolve](const std::string &markdown)
+		{
+			return Text::MarkdownToIrc(Text::ExpandTokens(markdown, resolve));
+		};
+
+		std::string text = render(msg.content);
 
 		if (!msg.attachments.empty())
 		{
@@ -338,10 +276,38 @@ class DiscordProtocol final
 
 		/* An embed is only interesting when there is nothing else to show;
 		 * most embeds are just an unfurled link which is in the content. */
-		if (text.empty() && !msg.embeds.empty() && !msg.embeds.front().title.empty())
-			text = "[embed: " + msg.embeds.front().title + "]";
+		if (text.empty() && !msg.embeds.empty())
+		{
+			const auto &embed = msg.embeds.front();
+			std::string summary = embed.title;
+			if (!embed.description.empty())
+				summary += (summary.empty() ? "" : " \xe2\x80\x94 ") + Text::TruncateCodePoints(embed.description, 300);
 
-		if (!text.empty() && msg.message_reference.message_id)
+			const size_t shown = std::min<size_t>(embed.fields.size(), 3);
+			for (size_t idx = 0; idx < shown; ++idx)
+				summary += " [" + embed.fields[idx].name + ": " + Text::TruncateCodePoints(embed.fields[idx].value, 100) + "]";
+
+			if (!summary.empty())
+				text = "[embed] " + render(summary);
+		}
+
+		/* A forwarded message carries its content in a snapshot. */
+		if (text.empty() && msg.has_snapshot())
+		{
+			const auto &forwarded = msg.message_snapshots.messages;
+			const size_t shown = std::min<size_t>(forwarded.size(), 3);
+			for (size_t idx = 0; idx < shown; ++idx)
+			{
+				const std::string content = render(forwarded[idx].content);
+				if (content.empty())
+					continue;
+				text += (text.empty() ? "" : "\n") + std::string("(forwarded) ") + content;
+			}
+		}
+
+		/* A forward references the original message too, but is not a reply
+		 * to it. */
+		if (!text.empty() && msg.message_reference.message_id && !msg.has_snapshot())
 			text.insert(0, "(reply) ");
 
 		/* Carriage returns and NULs can not be sent to IRC; newlines are
@@ -356,17 +322,36 @@ class DiscordProtocol final
 		return clean;
 	}
 
-	/** Handles an incoming Discord message on the Discord thread. */
-	static void HandleMessage(const std::shared_ptr<DiscordState> &state, const dpp::message &msg, bool edit)
+	/** Resolves the bridged channel a Discord channel maps to: itself, or
+	 * its parent when it is a thread of a bridged channel.
+	 * @return The bridged channel id, or an empty string if there is none.
+	 */
+	static std::string BridgedChannel(DiscordFilter &filter, dpp::snowflake channel_id)
 	{
-		const std::string channel_id = msg.channel_id.str();
-		if (!state->IsBridged(channel_id))
+		const std::string id = channel_id.str();
+		if (filter.IsBridged(id))
+			return id;
+
+		if (const auto *channel = dpp::find_channel(channel_id))
+		{
+			const std::string parent = channel->parent_id.str();
+			if (channel->parent_id && filter.IsBridged(parent))
+				return parent;
+		}
+		return "";
+	}
+
+	/** Handles an incoming Discord message on the Discord thread. */
+	static void HandleMessage(const std::shared_ptr<DiscordFilter> &filter, const std::shared_ptr<Mailbox> &mailbox, const dpp::message &msg, bool edit)
+	{
+		const std::string channel_id = BridgedChannel(*filter, msg.channel_id);
+		if (channel_id.empty())
 			return;
 
 		/* Messages which this module sent itself must not come back: either
 		 * through one of its webhooks, or through the bot account when the
 		 * webhook fallback is in use. Other bots are relayed as normal. */
-		if (state->IsOwnWebhook(msg.webhook_id.str()) || state->IsSelf(msg.author.id.str()))
+		if (filter->IsOwnWebhook(msg.webhook_id.str()) || filter->IsSelf(msg.author.id.str()))
 			return;
 
 		BridgeMessage relay;
@@ -376,7 +361,7 @@ class DiscordProtocol final
 
 		relay.protocol = "discord";
 		relay.channel = channel_id;
-		relay.guild = msg.guild_id.str();
+		relay.space = msg.guild_id.str();
 		relay.user_id = msg.author.id.str();
 		relay.msg_id = msg.id.str();
 		relay.edit = edit;
@@ -390,7 +375,7 @@ class DiscordProtocol final
 			display = "discord";
 		relay.display = display;
 
-		state->Post([relay](DiscordProtocol *protocol) { protocol->core->RelayToIrc(relay); });
+		mailbox->Post([relay](DiscordProtocol *protocol) { protocol->core->RelayToIrc(relay); });
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -408,61 +393,70 @@ class DiscordProtocol final
 			return;
 		}
 
+		/* A completion which was in flight when the previous cluster went
+		 * away will never arrive, so nothing may still be waiting on one. */
+		for (auto *bridge : this->core->GetBridges())
+		{
+			if (bridge->protocol.equals_ci(this->GetName()))
+				bridge->endpoint_pending = false;
+		}
+
 		static constexpr uint32_t intents = dpp::i_guilds | dpp::i_guild_messages | dpp::i_message_content;
 		this->cluster = new dpp::cluster(this->token.str(), intents);
 
-		auto state = this->state;
+		auto mailbox = this->mailbox;
+		auto filter = this->filter;
 
-		this->cluster->on_log([state](const dpp::log_t &event)
+		this->cluster->on_log([mailbox](const dpp::log_t &event)
 		{
 			if (event.severity < dpp::ll_warning)
 				return;
 
 			const std::string message = event.message;
-			state->Post([message](DiscordProtocol *protocol)
+			mailbox->Post([message](DiscordProtocol *protocol)
 			{
 				Log(protocol->core->GetOwner()) << "DPP: " << message;
 			});
 		});
 
-		this->cluster->on_ready([state](const dpp::ready_t &event)
+		this->cluster->on_ready([mailbox, filter](const dpp::ready_t &event)
 		{
 			const auto guilds = event.guild_count;
 
 			/* The bot account is only known once the gateway says hello. */
 			if (event.owner)
-				state->SetSelf(event.owner->me.id.str());
+				filter->SetSelf(event.owner->me.id.str());
 
-			state->Post([guilds](DiscordProtocol *protocol) { protocol->OnReady(guilds); });
+			mailbox->Post([guilds](DiscordProtocol *protocol) { protocol->OnReady(guilds); });
 		});
 
-		this->cluster->on_message_create([state](const dpp::message_create_t &event)
+		this->cluster->on_message_create([mailbox, filter](const dpp::message_create_t &event)
 		{
-			HandleMessage(state, event.msg, false);
+			HandleMessage(filter, mailbox, event.msg, false);
 		});
 
-		this->cluster->on_message_update([state](const dpp::message_update_t &event)
+		this->cluster->on_message_update([mailbox, filter](const dpp::message_update_t &event)
 		{
-			HandleMessage(state, event.msg, true);
+			HandleMessage(filter, mailbox, event.msg, true);
 		});
 
-		this->cluster->on_message_delete([state](const dpp::message_delete_t &event)
+		this->cluster->on_message_delete([mailbox, filter](const dpp::message_delete_t &event)
 		{
-			const std::string channel_id = event.channel_id.str();
-			if (!state->IsBridged(channel_id))
+			const std::string channel_id = BridgedChannel(*filter, event.channel_id);
+			if (channel_id.empty())
 				return;
 
 			BridgeMessage relay;
 			relay.protocol = "discord";
 			relay.channel = channel_id;
-			relay.guild = event.guild_id.str();
+			relay.space = event.guild_id.str();
 			relay.msg_id = event.id.str();
 			relay.del = true;
 
-			state->Post([relay](DiscordProtocol *protocol) { protocol->core->RelayToIrc(relay); });
+			mailbox->Post([relay](DiscordProtocol *protocol) { protocol->core->RelayToIrc(relay); });
 		});
 
-		this->thread = new DiscordThread(this->cluster, this->state);
+		this->thread = new DiscordThread(this->cluster, this->mailbox);
 		this->thread->Start();
 	}
 
@@ -516,15 +510,15 @@ class DiscordProtocol final
 		hook.channel_id = dpp::snowflake(bridge->foreign_channel.c_str());
 		hook.name = this->webhook_name.str();
 
-		auto state = this->state;
+		auto mailbox = this->mailbox;
 		try
 		{
-			this->cluster->create_webhook(hook, [state, key, channel](const dpp::confirmation_callback_t &cb)
+			this->cluster->create_webhook(hook, [mailbox, key, channel](const dpp::confirmation_callback_t &cb)
 			{
 				if (cb.is_error())
 				{
 					const std::string error = cb.get_error().human_readable;
-					state->Post([key, error](DiscordProtocol *protocol) { protocol->OnWebhookFailed(key, error); });
+					mailbox->Post([key, error](DiscordProtocol *protocol) { protocol->OnWebhookFailed(key, error); });
 					return;
 				}
 
@@ -538,11 +532,11 @@ class DiscordProtocol final
 				}
 				catch (const dpp::exception &)
 				{
-					state->Post([key](DiscordProtocol *protocol) { protocol->OnWebhookFailed(key, "malformed webhook response"); });
+					mailbox->Post([key](DiscordProtocol *protocol) { protocol->OnWebhookFailed(key, "malformed webhook response"); });
 					return;
 				}
 
-				state->Post([key, channel, id, tok](DiscordProtocol *protocol) { protocol->OnWebhookReady(key, channel, id, tok, true); });
+				mailbox->Post([key, channel, id, tok](DiscordProtocol *protocol) { protocol->OnWebhookReady(key, channel, id, tok, true); });
 			});
 		}
 		catch (const dpp::exception &err)
@@ -574,7 +568,7 @@ class DiscordProtocol final
 		bridge->endpoint_token = tok;
 		this->core->SaveBridge(bridge);
 
-		this->state->AddOwnWebhook(id);
+		this->filter->AddOwnWebhook(id);
 		Log(this->core->GetOwner()) << "BridgeServ: " << (created ? "created" : "adopted") << " Discord webhook " << id << " for " << key;
 	}
 
@@ -607,7 +601,7 @@ class DiscordProtocol final
 			bridge->endpoint_failed_at = Anope::CurTime;
 			++bridge->endpoint_failures;
 
-			this->state->DelOwnWebhook(bridge->endpoint_id.str());
+			this->filter->DelOwnWebhook(bridge->endpoint_id.str());
 			bridge->endpoint_id.clear();
 			bridge->endpoint_token.clear();
 			bridge->endpoint_pending = false;
@@ -632,7 +626,7 @@ class DiscordProtocol final
 
 		bridge->endpoint_pending = true;
 
-		auto state = this->state;
+		auto mailbox = this->mailbox;
 		const Anope::string key = bridge->irc_channel;
 		const Anope::string channel = bridge->foreign_channel;
 		const std::string wanted = this->webhook_name.str();
@@ -641,12 +635,12 @@ class DiscordProtocol final
 		 * on every load, which would litter the channel with dead webhooks. */
 		try
 		{
-			this->cluster->get_channel_webhooks(dpp::snowflake(channel.c_str()), [state, key, channel, wanted](const dpp::confirmation_callback_t &cb)
+			this->cluster->get_channel_webhooks(dpp::snowflake(channel.c_str()), [mailbox, key, channel, wanted](const dpp::confirmation_callback_t &cb)
 			{
 				if (cb.is_error())
 				{
 					const std::string error = cb.get_error().human_readable;
-					state->Post([key, error](DiscordProtocol *protocol) { protocol->OnWebhookFailed(key, error); });
+					mailbox->Post([key, error](DiscordProtocol *protocol) { protocol->OnWebhookFailed(key, error); });
 					return;
 				}
 
@@ -666,16 +660,16 @@ class DiscordProtocol final
 				}
 				catch (const dpp::exception &)
 				{
-					state->Post([key](DiscordProtocol *protocol) { protocol->OnWebhookFailed(key, "malformed webhook list response"); });
+					mailbox->Post([key](DiscordProtocol *protocol) { protocol->OnWebhookFailed(key, "malformed webhook list response"); });
 					return;
 				}
 
 				if (id.empty())
 				{
-					state->Post([key, channel](DiscordProtocol *protocol) { protocol->CreateWebhook(key, channel); });
+					mailbox->Post([key, channel](DiscordProtocol *protocol) { protocol->CreateWebhook(key, channel); });
 					return;
 				}
-				state->Post([key, channel, id, tok](DiscordProtocol *protocol) { protocol->OnWebhookReady(key, channel, id, tok, false); });
+				mailbox->Post([key, channel, id, tok](DiscordProtocol *protocol) { protocol->OnWebhookReady(key, channel, id, tok, false); });
 			});
 		}
 		catch (const dpp::exception &err)
@@ -689,11 +683,16 @@ class DiscordProtocol final
 		this->connected = true;
 		Log(this->core->GetOwner()) << "BridgeServ: connected to Discord (" << guilds << " guild(s)).";
 
-		/* Ready fires again after a reconnect; webhook setup is idempotent. */
+		/* Ready fires again after a reconnect; webhook setup is idempotent,
+		 * and a fresh connection is not made to wait out a backoff that was
+		 * earned on the old one. */
 		for (auto *bridge : this->core->GetBridges())
 		{
-			if (bridge->protocol.equals_ci(this->GetName()))
-				this->EnsureWebhook(bridge);
+			if (!bridge->protocol.equals_ci(this->GetName()))
+				continue;
+
+			bridge->endpoint_retry_at = 0;
+			this->EnsureWebhook(bridge);
 		}
 	}
 
@@ -708,15 +707,19 @@ class DiscordProtocol final
 public:
 	explicit DiscordProtocol(BridgeCore *c)
 		: BridgeProtocol("discord", c)
-		, state(std::make_shared<DiscordState>(this, this))
+		, mailbox(std::make_shared<Mailbox>(this, [this] { this->Notify(); }))
+		, filter(std::make_shared<DiscordFilter>())
 	{
 	}
 
 	~DiscordProtocol() override
 	{
 		/* Detach first: any Discord callback which is already in flight must
-		 * not be able to reach this object once it starts being destroyed. */
-		this->state->Detach();
+		 * not be able to reach this object once it starts being destroyed.
+		 * StopCluster then joins DPP's threads, so a wake which was copied
+		 * out of the mailbox before the detach still runs against a live
+		 * object. */
+		this->mailbox->Detach();
 		this->StopCluster();
 	}
 
@@ -728,9 +731,25 @@ public:
 
 	void Configure(Configuration::Block &block) override
 	{
-		this->domain = block.Get<const Anope::string>("domain", "discord.bridge");
-		this->webhook_name = block.Get<const Anope::string>("bridgename", "IRC Bridge");
-		this->webhook_suffix = block.Get<const Anope::string>("webhooksuffix", " (IRC)");
+		Anope::string domain_conf = block.Get<const Anope::string>("domain", "discord.bridge");
+		if (IRCD && !IRCD->IsHostValid(domain_conf))
+		{
+			Log(this->core->GetOwner()) << "BridgeServ: domain " << domain_conf << " is not a valid hostname; using discord.bridge";
+			domain_conf = "discord.bridge";
+		}
+		this->domain = domain_conf;
+
+		/* Discord rejects control characters in webhook names and limits
+		 * them to 80 characters. */
+		Anope::string name = Text::TruncateCodePoints(StripControl(block.Get<const Anope::string>("bridgename", "IRC Bridge").str()), 80);
+		if (name.empty())
+		{
+			Log(this->core->GetOwner()) << "BridgeServ: bridgename is empty; using \"IRC Bridge\".";
+			name = "IRC Bridge";
+		}
+		const bool name_changed = !this->webhook_name.empty() && this->webhook_name != name;
+		this->webhook_name = name;
+		this->webhook_suffix = StripControl(block.Get<const Anope::string>("webhooksuffix", " (IRC)").str());
 
 		const Anope::string new_token = block.Get<const Anope::string>("token");
 		if (new_token != this->token || !this->cluster)
@@ -738,6 +757,21 @@ public:
 			this->StopCluster();
 			this->token = new_token;
 			this->StartCluster();
+		}
+
+		/* Existing webhooks carry the old name; they are replaced so that
+		 * the name is what the operator configured everywhere. */
+		if (name_changed && this->cluster && this->connected)
+		{
+			for (auto *bridge : this->core->GetBridges())
+			{
+				if (!bridge->protocol.equals_ci(this->GetName()) || bridge->endpoint_id.empty())
+					continue;
+
+				this->OnBridgeRemoved(bridge);
+				this->core->SaveBridge(bridge);
+				this->EnsureWebhook(bridge);
+			}
 		}
 	}
 
@@ -755,8 +789,8 @@ public:
 				webhooks.insert(bridge->endpoint_id.str());
 		}
 
-		this->state->SetBridged(std::move(channels));
-		this->state->SetOwnWebhooks(std::move(webhooks));
+		this->filter->SetBridged(std::move(channels));
+		this->filter->SetOwnWebhooks(std::move(webhooks));
 
 		if (!this->connected)
 			return;
@@ -774,21 +808,21 @@ public:
 			return;
 
 		const std::string id = bridge->endpoint_id.str();
-		this->state->DelOwnWebhook(id);
+		this->filter->DelOwnWebhook(id);
 
 		if (this->cluster && this->connected)
 		{
-			auto state = this->state;
+			auto mailbox = this->mailbox;
 			const Anope::string key = bridge->irc_channel;
 			try
 			{
-				this->cluster->delete_webhook(dpp::snowflake(bridge->endpoint_id.c_str()), [state, key](const dpp::confirmation_callback_t &cb)
+				this->cluster->delete_webhook(dpp::snowflake(bridge->endpoint_id.c_str()), [mailbox, key](const dpp::confirmation_callback_t &cb)
 				{
 					if (!cb.is_error())
 						return;
 
 					const std::string error = cb.get_error().human_readable;
-					state->Post([key, error](DiscordProtocol *protocol)
+					mailbox->Post([key, error](DiscordProtocol *protocol)
 					{
 						Log(protocol->core->GetOwner()) << "BridgeServ: unable to delete the webhook for " << key << ": " << error;
 					});
@@ -811,26 +845,26 @@ public:
 		if (!this->cluster || !this->connected)
 			return;
 
-		std::string text = dpp::utility::markdown_escape(out.text.str(), true);
+		std::string text = Text::EscapeLineStart(dpp::utility::markdown_escape(out.text.str(), true));
 
 		/* Discord rejects messages longer than 2000 characters. The body is
 		 * truncated before the italic markers are added so that an oversized
 		 * action does not lose its closing marker. */
-		text = Text::TruncateUtf8(text, out.action ? 1998 : 2000);
+		text = Text::TruncateCodePoints(text, out.action ? 1998 : 2000);
+
+		/* A trailing escape left behind by the truncation would escape the
+		 * closing marker of an action, or leak as a literal backslash. */
+		size_t slashes = 0;
+		while (slashes < text.length() && text[text.length() - 1 - slashes] == '\\')
+			++slashes;
+		if (slashes % 2)
+			text.erase(text.length() - 1);
+
 		if (text.empty())
 			return;
 
-		/* A trailing escape would escape the closing marker instead. */
 		if (out.action)
-		{
-			size_t slashes = 0;
-			while (slashes < text.length() && text[text.length() - 1 - slashes] == '\\')
-				++slashes;
-			if (slashes % 2)
-				text.erase(text.length() - 1);
-
 			text = "*" + text + "*";
-		}
 
 		const dpp::snowflake channel(bridge->foreign_channel.c_str());
 		dpp::message msg(channel, text);
@@ -841,21 +875,21 @@ public:
 
 		if (!bridge->endpoint_id.empty())
 		{
-			auto state = this->state;
+			auto mailbox = this->mailbox;
 			const Anope::string key = bridge->irc_channel;
 			try
 			{
 				dpp::webhook hook(dpp::snowflake(bridge->endpoint_id.c_str()), bridge->endpoint_token.str());
 				hook.name = Text::WebhookName(out.nick.str(), this->webhook_suffix.str());
 
-				this->cluster->execute_webhook(hook, msg, false, 0, "", [state, key](const dpp::confirmation_callback_t &cb)
+				this->cluster->execute_webhook(hook, msg, false, 0, "", [mailbox, key](const dpp::confirmation_callback_t &cb)
 				{
 					if (!cb.is_error())
 						return;
 
 					const auto status = cb.http_info.status;
 					const std::string error = cb.get_error().human_readable;
-					state->Post([key, status, error](DiscordProtocol *protocol)
+					mailbox->Post([key, status, error](DiscordProtocol *protocol)
 					{
 						protocol->OnWebhookSendFailed(key, status, error);
 					});
@@ -870,7 +904,7 @@ public:
 
 		/* No usable webhook; fall back to the bot account and try to set a
 		 * webhook up for the next message. */
-		dpp::message fallback(channel, "<" + out.nick.str() + "> " + text);
+		dpp::message fallback(channel, "<" + dpp::utility::markdown_escape(out.nick.str()) + "> " + text);
 		fallback.set_allowed_mentions(false, false, false, false);
 		try
 		{
@@ -883,7 +917,7 @@ public:
 		this->EnsureWebhook(bridge);
 	}
 
-	void ListGuilds(const Anope::string &requester, const Anope::string &svc) override
+	void ListSpaces(const Anope::string &requester, const Anope::string &svc) override
 	{
 		if (!this->cluster || !this->connected)
 		{
@@ -891,9 +925,9 @@ public:
 			return;
 		}
 
-		auto state = this->state;
+		auto mailbox = this->mailbox;
 		const Anope::string nick = requester;
-		this->cluster->current_user_get_guilds([state, nick, svc](const dpp::confirmation_callback_t &cb)
+		this->cluster->current_user_get_guilds([mailbox, nick, svc](const dpp::confirmation_callback_t &cb)
 		{
 			bool failed = cb.is_error();
 			std::vector<Anope::string> lines;
@@ -911,14 +945,14 @@ public:
 			}
 
 			std::sort(lines.begin(), lines.end());
-			state->Post([nick, svc, failed, lines](DiscordProtocol *protocol)
+			mailbox->Post([nick, svc, failed, lines](DiscordProtocol *protocol)
 			{
 				protocol->core->DeliverListing(nick, svc, false, failed, lines);
 			});
 		});
 	}
 
-	void ListChannels(const Anope::string &guild, const Anope::string &requester, const Anope::string &svc) override
+	void ListChannels(const Anope::string &space, const Anope::string &requester, const Anope::string &svc) override
 	{
 		if (!this->cluster || !this->connected)
 		{
@@ -926,9 +960,9 @@ public:
 			return;
 		}
 
-		auto state = this->state;
+		auto mailbox = this->mailbox;
 		const Anope::string nick = requester;
-		this->cluster->channels_get(dpp::snowflake(guild.c_str()), [state, nick, svc](const dpp::confirmation_callback_t &cb)
+		this->cluster->channels_get(dpp::snowflake(space.c_str()), [mailbox, nick, svc](const dpp::confirmation_callback_t &cb)
 		{
 			bool failed = cb.is_error();
 			std::vector<Anope::string> lines;
@@ -951,7 +985,7 @@ public:
 			}
 
 			std::sort(lines.begin(), lines.end());
-			state->Post([nick, svc, failed, lines](DiscordProtocol *protocol)
+			mailbox->Post([nick, svc, failed, lines](DiscordProtocol *protocol)
 			{
 				protocol->core->DeliverListing(nick, svc, true, failed, lines);
 			});
@@ -962,14 +996,14 @@ public:
 	{
 		for (;;)
 		{
-			DiscordState::Job job;
-			if (!this->state->PopJob(job))
+			Mailbox::Job job;
+			if (!this->mailbox->Pop(job))
 				break;
 
 			job(this);
 		}
 
-		if (const auto dropped = this->state->TakeDropped())
+		if (const auto dropped = this->mailbox->TakeDropped())
 			Log(this->core->GetOwner()) << "BridgeServ: dropped " << dropped << " queued Discord events; the bridge is falling behind.";
 	}
 };
@@ -983,7 +1017,7 @@ void DiscordThread::Run()
 	catch (const dpp::exception &err)
 	{
 		const std::string error = err.what();
-		this->state->Post([error](DiscordProtocol *protocol) { protocol->OnStopped(error); });
+		this->mailbox->Post([error](DiscordProtocol *protocol) { protocol->OnStopped(error); });
 	}
 }
 

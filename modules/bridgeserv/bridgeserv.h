@@ -15,6 +15,7 @@
 #pragma once
 
 #include "module.h"
+#include "modules/bridgeserv/relay.h"
 
 #include <vector>
 
@@ -32,7 +33,7 @@ struct BridgeMessage final
 	/* The protocol which produced the message. */
 	Anope::string protocol;
 	/* The remote space (a Discord guild, for example) it was sent in. */
-	Anope::string guild;
+	Anope::string space;
 	/* The remote channel it was sent in. */
 	Anope::string channel;
 	/* The remote user who sent it, and their display name. */
@@ -84,13 +85,14 @@ public:
 	virtual void RelayToIrc(const BridgeMessage &msg) = 0;
 
 	/** Delivers the result of an asynchronous listing to its requester.
-	 * @param nick The nickname which asked for the listing.
+	 * @param requester The UID (or, on IRCds without UIDs, the nickname) of
+	 *                  the user who asked for the listing.
 	 * @param svc The service the listing was asked of.
 	 * @param channels Whether the listing is of channels rather than spaces.
 	 * @param failed Whether the listing could not be retrieved.
 	 * @param lines The listing.
 	 */
-	virtual void DeliverListing(const Anope::string &nick, const Anope::string &svc, bool channels, bool failed, const std::vector<Anope::string> &lines) = 0;
+	virtual void DeliverListing(const Anope::string &requester, const Anope::string &svc, bool channels, bool failed, const std::vector<Anope::string> &lines) = 0;
 
 	/** Marks a bridge as needing to be written to the database. */
 	virtual void SaveBridge(Bridge *bridge) = 0;
@@ -148,11 +150,14 @@ public:
 	 */
 	virtual void OnBridgeRemoved(Bridge *bridge) { (void)bridge; }
 
-	/** Asks the network for the spaces the bridge account can see. */
-	virtual void ListGuilds(const Anope::string &nick, const Anope::string &svc) = 0;
+	/** Asks the network for the spaces the bridge account can see.
+	 * @param requester The identity to pass back to DeliverListing().
+	 * @param svc The service the listing was asked of.
+	 */
+	virtual void ListSpaces(const Anope::string &requester, const Anope::string &svc) = 0;
 
 	/** Asks the network for the channels of one space. */
-	virtual void ListChannels(const Anope::string &guild, const Anope::string &nick, const Anope::string &svc) = 0;
+	virtual void ListChannels(const Anope::string &space, const Anope::string &requester, const Anope::string &svc) = 0;
 };
 
 /** A bridge between an IRC channel and a channel on a bridged network. */
@@ -165,7 +170,7 @@ public:
 	/* The IRC channel which the remote channel is relayed into. */
 	Anope::string irc_channel;
 	/* The remote space and channel which are relayed into IRC. */
-	Anope::string guild;
+	Anope::string space;
 	Anope::string foreign_channel;
 	/* Appended to the nickname of every client of this bridge, so that the
 	 * same remote user can be told apart per channel mapping. */
@@ -183,10 +188,8 @@ public:
 	time_t endpoint_failed_at = 0;
 	unsigned endpoint_failures = 0;
 
-	/* Token bucket which throttles relaying into the IRC channel. */
-	unsigned tokens = 0;
-	time_t tokens_at = 0;
-	unsigned throttled = 0;
+	/* Throttles relaying into the IRC channel. */
+	BridgeServ::Relay::TokenBucket throttle;
 
 	Bridge()
 		: Serializable("Bridge")

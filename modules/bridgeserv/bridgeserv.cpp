@@ -29,14 +29,13 @@
 
 #include <algorithm>
 #include <cctype>
-#include <deque>
 #include <functional>
 #include <map>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
+namespace Relay = BridgeServ::Relay;
 namespace Text = BridgeServ::Text;
 
 class ModuleBridgeServ;
@@ -68,6 +67,9 @@ class BridgeClient final
 public:
 	Anope::string key;
 	Anope::string user_id;
+	/* The display name the client was introduced for; a change retires
+	 * the client so that the new name can be introduced. */
+	Anope::string display;
 	User *user = nullptr;
 	std::set<Anope::string> chans;
 	time_t last_active = Anope::CurTime;
@@ -194,17 +196,9 @@ class ModuleBridgeServ final
 	/* The pseudo clients of bridged networks, keyed by BridgeClient::key. */
 	std::map<Anope::string, BridgeClient *> clients;
 
-	/* What was last relayed for a message, keyed by "<channel id>/<message
-	 * id>": the hash covers the whole rendering so that an edit beyond the
-	 * preview is still seen as a change, and the preview is what the delete
-	 * notice quotes. */
-	struct Relayed final
-	{
-		size_t hash = 0;
-		Anope::string preview;
-	};
-	std::unordered_map<std::string, Relayed> relayed;
-	std::deque<std::string> relayed_order;
+	/* What was last relayed for a message, keyed by
+	 * "<protocol>/<channel id>/<message id>". */
+	Relay::History relayed;
 
 	CommandBSAdd cmd_add;
 	CommandBSSet cmd_set;
@@ -218,9 +212,9 @@ class ModuleBridgeServ final
 	/* Virtual links                                                      */
 	/* ------------------------------------------------------------------ */
 
-	static Anope::string LinkKey(const BridgeProtocol *protocol, const Anope::string &guild)
+	static Anope::string LinkKey(const BridgeProtocol *protocol, const Anope::string &space)
 	{
-		return protocol->GetName() + "/" + guild;
+		return protocol->GetName() + "/" + space;
 	}
 
 	/** Introduces, or finds, the virtual link a bridged space appears behind.
@@ -231,9 +225,9 @@ class ModuleBridgeServ final
 	 * with the usual server oriented commands. The link is created with the
 	 * services-created flag, which tells Anope not to expect a burst from it.
 	 */
-	Server *EnsureLink(BridgeProtocol *protocol, const Anope::string &guild)
+	Server *EnsureLink(BridgeProtocol *protocol, const Anope::string &space)
 	{
-		const Anope::string key = LinkKey(protocol, guild);
+		const Anope::string key = LinkKey(protocol, space);
 		const auto it = this->links.find(key);
 		if (it != this->links.end())
 			return it->second;
@@ -241,7 +235,7 @@ class ModuleBridgeServ final
 		if (!IRCD || !Servers::GetUplink() || !Servers::GetUplink()->IsSynced())
 			return nullptr;
 
-		const Anope::string name = guild + "." + protocol->GetDomain();
+		const Anope::string name = space + "." + protocol->GetDomain();
 		if (!IRCD->IsHostValid(name) || name.find('.') == Anope::string::npos)
 		{
 			Log(this) << "BridgeServ: " << name << " is not a usable link name; check the " << protocol->GetName() << " domain.";
@@ -260,7 +254,7 @@ class ModuleBridgeServ final
 			return existing;
 		}
 
-		const Anope::string desc = Anope::Format("IRC bridge link (%s %s)", protocol->GetName().c_str(), guild.c_str());
+		const Anope::string desc = Anope::Format("IRC bridge link (%s %s)", protocol->GetName().c_str(), space.c_str());
 		auto *link = new Server(Me, name, desc, IRCD->SID_Retrieve(), 1, true);
 		IRCD->SendServer(link);
 
@@ -321,26 +315,33 @@ class ModuleBridgeServ final
 		this->SendReservation(nick, true);
 	}
 
+	/** Whether a bridge other than the given one reserves a nickname. */
+	bool HeldElsewhere(const Bridge *bridge, const Anope::string &nick) const
+	{
+		for (const auto *other : this->bridges)
+		{
+			if (other != bridge && other->reserved.count(nick))
+				return true;
+		}
+		return false;
+	}
+
 	/** Releases the nicknames a bridge reserved, unless another bridge still
 	 * reserves them.
+	 * @return The number of nicknames actually released.
 	 */
-	void ReleaseNicks(const Bridge *bridge)
+	size_t ReleaseNicks(const Bridge *bridge)
 	{
+		size_t released = 0;
 		for (const auto &nick : bridge->reserved)
 		{
-			bool held = false;
-			for (const auto *other : this->bridges)
-			{
-				if (other != bridge && other->reserved.count(nick))
-				{
-					held = true;
-					break;
-				}
-			}
+			if (this->HeldElsewhere(bridge, nick))
+				continue;
 
-			if (!held)
-				this->SendReservation(nick, false);
+			this->SendReservation(nick, false);
+			++released;
 		}
+		return released;
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -354,23 +355,7 @@ class ModuleBridgeServ final
 		const size_t reserved = suffix.length() + 3;
 		const size_t budget = maxlen > reserved ? maxlen - reserved : 1;
 
-		Anope::string base;
-		for (const auto raw_chr : raw)
-		{
-			if (base.length() >= budget)
-				break;
-
-			const auto chr = static_cast<unsigned char>(raw_chr);
-			if (chr < 0x80 && std::isalnum(chr))
-				base += static_cast<char>(chr);
-			else if (!base.empty() && base[base.length() - 1] != '_')
-				base += '_';
-		}
-		while (!base.empty() && base[base.length() - 1] == '_')
-			base.erase(base.length() - 1);
-
-		if (base.empty())
-			base = "bridge";
+		const Anope::string base = Relay::SanitiseNick(raw.str(), budget);
 
 		Anope::string nick = base + suffix;
 		if (!IRCD->IsNickValid(nick))
@@ -389,7 +374,7 @@ class ModuleBridgeServ final
 		return nick;
 	}
 
-	Anope::string MakeIdent(const Anope::string &user_id) const
+	Anope::string MakeIdent(const Anope::string &user_id)
 	{
 		/* The identity of a remote user is stable and unique, but not usable
 		 * as an ident, so a hash of it is used instead. */
@@ -405,7 +390,10 @@ class ModuleBridgeServ final
 			hex = hex.substr(0, maxlen);
 
 		if (hex.empty() || !IRCD->IsIdentValid(hex))
+		{
+			Log(this) << "BridgeServ: the derived ident for " << user_id << " is not valid on this IRCd; using \"bridge\".";
 			return "bridge";
+		}
 		return hex;
 	}
 
@@ -415,12 +403,22 @@ class ModuleBridgeServ final
 		if (!protocol)
 			return nullptr;
 
-		const Anope::string key = LinkKey(protocol, bridge->guild) + "/" + bridge->nick_suffix + "/" + user_id;
+		const Anope::string key = LinkKey(protocol, bridge->space) + "/" + bridge->nick_suffix + "/" + user_id;
 		const auto it = this->clients.find(key);
 		if (it != this->clients.end())
-			return it->second;
+		{
+			BridgeClient *client = it->second;
+			if (client->display == display)
+				return client;
 
-		Server *link = this->EnsureLink(protocol, bridge->guild);
+			/* The client was introduced under an old display name; it is
+			 * retired so that a fresh one can carry the new name. The old
+			 * nickname stays reserved for as long as the bridge exists. */
+			const bool synced = Servers::GetUplink() && Servers::GetUplink()->IsSynced();
+			this->RemoveClient(client, "Display name changed", synced);
+		}
+
+		Server *link = this->EnsureLink(protocol, bridge->space);
 		if (!link)
 			return nullptr;
 
@@ -441,8 +439,14 @@ class ModuleBridgeServ final
 		if (!user)
 		{
 			/* The nick or UID collided with a real user; both sides have been
-			 * killed by the factory, so there is nobody to relay as. */
+			 * killed by the factory, so there is nobody to relay as. The
+			 * reservation is rolled back so the nick is not held for a
+			 * client which never existed. */
 			Log(this) << "BridgeServ: collision introducing pseudo client " << nick << "; dropping message.";
+			bridge->reserved.erase(nick);
+			if (!this->HeldElsewhere(bridge, nick))
+				this->SendReservation(nick, false);
+			this->SaveBridge(bridge);
 			return nullptr;
 		}
 		IRCD->SendClientIntroduction(user);
@@ -450,6 +454,7 @@ class ModuleBridgeServ final
 		auto *client = new BridgeClient();
 		client->key = key;
 		client->user_id = user_id;
+		client->display = display;
 		client->user = user;
 		this->clients[key] = client;
 
@@ -488,76 +493,17 @@ class ModuleBridgeServ final
 	/* Relaying into IRC                                                  */
 	/* ------------------------------------------------------------------ */
 
-	/** Remembers the rendering of a relayed message for edit deduplication. */
-	void Remember(const std::string &key, const Relayed &what)
-	{
-		const auto result = this->relayed.emplace(key, what);
-		if (!result.second)
-		{
-			result.first->second = what;
-			return;
-		}
-
-		this->relayed_order.push_back(key);
-		while (this->relayed_order.size() > 256)
-		{
-			this->relayed.erase(this->relayed_order.front());
-			this->relayed_order.pop_front();
-		}
-	}
-
-	/** Calculates how many bytes of message payload fit on the wire. */
-	size_t PayloadBudget(User *u, const Anope::string &target) const
-	{
-		size_t source = u->GetUID().length();
-		source = std::max(source, u->nick.length() + u->GetIdent().length() + u->GetDisplayedHost().length() + 2);
-
-		/* ":<source> PRIVMSG <target> :<payload>\r\n" */
-		const size_t overhead = 1 + source + 1 + 8 + target.length() + 2;
-		if (overhead + 64 >= 510)
-			return 64;
-		return 510 - overhead;
-	}
-
-	/** Consumes a relay token, refilling the bucket first. */
-	bool TakeToken(Bridge *bridge)
-	{
-		if (!this->flood_lines)
-			return true;
-
-		const time_t secs = std::max<time_t>(this->flood_secs, 1);
-		if (!bridge->tokens_at)
-		{
-			bridge->tokens = this->flood_lines;
-			bridge->tokens_at = Anope::CurTime;
-		}
-
-		const time_t elapsed = Anope::CurTime - bridge->tokens_at;
-		if (elapsed >= secs)
-		{
-			const time_t refill = elapsed / secs;
-			bridge->tokens = static_cast<unsigned>(std::min<time_t>(this->flood_lines, bridge->tokens + refill));
-			bridge->tokens_at += refill * secs;
-		}
-
-		if (!bridge->tokens)
-			return false;
-
-		--bridge->tokens;
-		return true;
-	}
-
 	void RelayDelete(Bridge *bridge, const std::string &key)
 	{
 		if (!this->relay_deletes)
 			return;
 
-		const auto it = this->relayed.find(key);
-		if (it == this->relayed.end())
+		const auto *previous = this->relayed.Find(key);
+		if (!previous)
 			return;
 
-		const Anope::string preview = it->second.preview;
-		this->relayed.erase(it);
+		const Anope::string preview = previous->preview;
+		this->relayed.Forget(key);
 
 		auto *bi = this->GetClient();
 		if (bi)
@@ -600,13 +546,20 @@ class ModuleBridgeServ final
 			delete client;
 		this->clients.clear();
 
+		/* Server::Delete fires OnServerQuit synchronously, which would
+		 * otherwise mutate the map while it is being walked. */
+		std::vector<Server *> stale;
+		stale.reserve(this->links.size());
 		for (const auto &[_, link] : this->links)
+			stale.push_back(link);
+		this->links.clear();
+
+		for (auto *link : stale)
 		{
 			if (synced)
 				IRCD->SendSquit(link, reason);
 			link->Delete(reason);
 		}
-		this->links.clear();
 	}
 
 public:
@@ -653,10 +606,10 @@ public:
 			return;
 
 		/* Only relay traffic from the space the bridge was pointed at. */
-		if (!msg.guild.empty() && msg.guild != "0" && !bridge->guild.equals_ci(msg.guild))
+		if (!msg.space.empty() && msg.space != "0" && !bridge->space.equals_ci(msg.space))
 			return;
 
-		const std::string key = msg.channel.str() + "/" + msg.msg_id.str();
+		const std::string key = msg.protocol.str() + "/" + msg.channel.str() + "/" + msg.msg_id.str();
 		if (msg.del)
 		{
 			this->RelayDelete(bridge, key);
@@ -666,17 +619,17 @@ public:
 		if (msg.text.empty())
 			return;
 
-		Relayed record;
+		Relay::History::Entry record;
 		record.hash = std::hash<std::string>{ }(msg.text.str());
-		record.preview = msg.text.substr(0, 60);
+		record.preview = msg.text.substr(0, 60).str();
 
 		if (msg.edit)
 		{
 			if (!this->relay_edits)
 				return;
 
-			const auto it = this->relayed.find(key);
-			if (it == this->relayed.end() || it->second.hash == record.hash)
+			const auto *previous = this->relayed.Find(key);
+			if (!previous || previous->hash == record.hash)
 				return; // never relayed, or nothing visible changed.
 		}
 
@@ -687,60 +640,60 @@ public:
 		client->last_active = Anope::CurTime;
 		this->EnsureJoin(client, bridge->irc_channel);
 
-		auto lines = Text::SplitRelayLines(msg.text.str());
-		size_t skipped = 0;
-		if (lines.size() > this->max_lines)
+		User *u = client->user;
+		const size_t source_len = std::max(u->GetUID().length(),
+			u->nick.length() + u->GetIdent().length() + u->GetDisplayedHost().length() + 2);
+		const size_t budget = Relay::PayloadBudget(source_len, bridge->irc_channel.length());
+
+		std::string text = msg.text.str();
+		if (msg.edit)
 		{
-			skipped = lines.size() - this->max_lines;
-			lines.resize(this->max_lines);
+			const size_t at = text.find_first_not_of('\n');
+			if (at != std::string::npos)
+				text.insert(at, "(edit) ");
 		}
+		const auto wire = Relay::SplitForWire(text, budget, this->max_lines);
 
-		const size_t budget = this->PayloadBudget(client->user, bridge->irc_channel);
-		bool first = true;
 		bool sent = false;
-		for (const auto &line : lines)
+		for (const auto &line : wire.lines)
 		{
-			std::string pending = line;
-			if (first && msg.edit)
-				pending.insert(0, "(edit) ");
-			first = false;
-
-			while (!pending.empty())
+			if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs, Anope::CurTime))
 			{
-				const std::string chunk = Text::TruncateUtf8(pending, budget);
-				if (chunk.empty())
-					break; // the budget can not fit even one character.
-
-				pending.erase(0, chunk.length());
-
-				if (!this->TakeToken(bridge))
-				{
-					++bridge->throttled;
-					continue;
-				}
-
-				if (bridge->throttled)
-				{
-					IRCD->SendNotice(client->user, bridge->irc_channel, Anope::Format(Language::Translate(_("%u bridge lines dropped (rate limit)")), bridge->throttled));
-					bridge->throttled = 0;
-				}
-				IRCD->SendPrivmsg(client->user, bridge->irc_channel, chunk);
-				sent = true;
+				++bridge->throttle.dropped;
+				continue;
 			}
+
+			/* The drop notice comes from the service, not the pseudo client:
+			 * it is about the bridge, not about the user who happened to
+			 * speak next. */
+			if (bridge->throttle.dropped)
+			{
+				if (auto *bi = this->GetClient())
+				{
+					IRCD->SendNotice(bi, bridge->irc_channel, Anope::Format(Language::Translate(_("%u bridge lines dropped (rate limit)")), bridge->throttle.dropped));
+					bridge->throttle.dropped = 0;
+				}
+			}
+			IRCD->SendPrivmsg(u, bridge->irc_channel, line);
+			sent = true;
 		}
 
 		/* Only a message which reached the channel is remembered, so that an
 		 * edit or delete of a message nobody saw stays silent. */
-		if (sent)
-			this->Remember(key, record);
+		if (!sent)
+			return;
 
-		if (skipped)
-			IRCD->SendNotice(client->user, bridge->irc_channel, Anope::Format(Language::Translate(_("... [message truncated, %zu more lines]")), skipped));
+		this->relayed.Remember(key, record);
+		if (wire.dropped)
+			IRCD->SendNotice(u, bridge->irc_channel, Anope::Format(Language::Translate(_("... [message truncated, %zu more lines]")), wire.dropped));
 	}
 
-	void DeliverListing(const Anope::string &nick, const Anope::string &svc, bool channels, bool failed, const std::vector<Anope::string> &lines) override
+	void DeliverListing(const Anope::string &requester, const Anope::string &svc, bool channels, bool failed, const std::vector<Anope::string> &lines) override
 	{
-		User *u = User::Find(nick, true);
+		/* The requester is a UID where the IRCd has them, which User::Find
+		 * resolves first; a nick change while the listing was in flight
+		 * therefore still finds the right user. */
+		User *u = User::Find(requester);
 		auto *bi = BotInfo::Find(svc, true);
 		if (!u || !bi)
 			return; // the requester or the service went away.
@@ -811,7 +764,10 @@ public:
 			this->JoinChannel(bridge);
 	}
 
-	void DropBridge(Bridge *bridge)
+	/** Removes a bridge.
+	 * @return The number of reserved nicknames which were released.
+	 */
+	size_t DropBridge(Bridge *bridge)
 	{
 		const auto it = std::find(this->bridges.begin(), this->bridges.end(), bridge);
 		if (it != this->bridges.end())
@@ -820,11 +776,12 @@ public:
 		if (auto *protocol = bridge->GetProtocol())
 			protocol->OnBridgeRemoved(bridge);
 
-		this->ReleaseNicks(bridge);
+		const size_t released = this->ReleaseNicks(bridge);
 		delete bridge;
 
 		this->BridgesChanged();
 		this->PruneChannels();
+		return released;
 	}
 
 	/** Tells every protocol that the set of bridges has changed. */
@@ -850,6 +807,31 @@ public:
 
 			for (const auto &chan : stale)
 				this->PartClient(client, chan, "Bridge removed");
+		}
+	}
+
+	/** Takes the pseudo clients of a bridge out of its channel, and off the
+	 * network if that was their only channel. They are named and grouped by
+	 * the space and suffix of the bridge, so after a change to either they
+	 * have to come back under the new key.
+	 */
+	void RetireClients(const Bridge *bridge, const Anope::string &reason)
+	{
+		const bool synced = IRCD && Servers::GetUplink() && Servers::GetUplink()->IsSynced();
+
+		/* RemoveClient erases the record through OnUserQuit. */
+		std::vector<BridgeClient *> snapshot;
+		for (const auto &[_, client] : this->clients)
+		{
+			if (client->chans.count(bridge->irc_channel))
+				snapshot.push_back(client);
+		}
+
+		for (auto *client : snapshot)
+		{
+			this->PartClient(client, bridge->irc_channel, reason);
+			if (client->chans.empty())
+				this->RemoveClient(client, reason, synced);
 		}
 	}
 
@@ -938,18 +920,39 @@ public:
 		this->btype = nullptr;
 	}
 
+	/** Reads a numeric setting, clamping it to its documented range. */
+	template<typename T>
+	T GetClamped(Configuration::Block &block, const Anope::string &key, const Anope::string &def, T lo, T hi)
+	{
+		const T given = block.Get<T>(key, def);
+		const T used = std::clamp(given, lo, hi);
+		if (used != given)
+			Log(this) << "BridgeServ: " << key << " " << given << " is out of range; using " << used << ".";
+		return used;
+	}
+
 	void OnReload(Configuration::Conf &conf) override
 	{
 		auto &block = conf.GetModule(this);
 
+		const Anope::string old_client = this->client_name;
 		this->client_name = block.Get<const Anope::string>("client", "BridgeServ");
+		if (!this->GetClient())
+			Log(this) << "BridgeServ: no service client named " << this->client_name << " exists.";
+
 		this->default_protocol = block.Get<const Anope::string>("protocol", "discord");
-		this->user_idle = block.Get<time_t>("useridle", "1h");
-		this->max_lines = std::max<size_t>(block.Get<size_t>("maxlines", "8"), 1);
-		this->flood_lines = block.Get<unsigned>("floodlines", "6");
-		this->flood_secs = std::max<time_t>(block.Get<time_t>("floodsecs", "4s"), 1);
+		this->max_lines = this->GetClamped<size_t>(block, "maxlines", "8", 1, 64);
+		this->flood_lines = this->GetClamped<unsigned>(block, "floodlines", "6", 0, 100);
+		this->flood_secs = this->GetClamped<time_t>(block, "floodsecs", "4s", 1, 3600);
 		this->relay_edits = block.Get<bool>("relayedits", "yes");
 		this->relay_deletes = block.Get<bool>("relaydeletes", "no");
+
+		/* Zero disables reaping; anything else is at least a minute so the
+		 * reaper can not quit a client which just spoke. */
+		const time_t idle = block.Get<time_t>("useridle", "1h");
+		this->user_idle = idle <= 0 ? 0 : std::max<time_t>(idle, 60);
+		if (this->user_idle != idle)
+			Log(this) << "BridgeServ: useridle " << idle << " is out of range; using " << this->user_idle << ".";
 
 		bool domain_changed = false;
 		for (auto *protocol : this->protocols)
@@ -965,6 +968,15 @@ public:
 		 * a domain change has to take them down and let them come back. */
 		if (domain_changed)
 			this->RemoveAllClients("Bridge domain changed");
+
+		/* A new service client has to be in the bridged channels; the old
+		 * one belongs to whichever module configured it and is left alone. */
+		const bool synced = IRCD && Servers::GetUplink() && Servers::GetUplink()->IsSynced();
+		if (synced && !old_client.empty() && !old_client.equals_ci(this->client_name))
+		{
+			for (auto *bridge : this->bridges)
+				this->JoinChannel(bridge);
+		}
 
 		this->BridgesChanged();
 	}
@@ -987,9 +999,36 @@ public:
 		this->BridgesChanged();
 	}
 
+	void OnServerQuit(Server *server) override
+	{
+		/* The server quits its own users as it goes away; the records only
+		 * need to be forgotten, and before the users are, so that nothing
+		 * looks them up through a link which no longer exists. */
+		for (auto it = this->clients.begin(); it != this->clients.end(); )
+		{
+			BridgeClient *client = it->second;
+			if (!client->user || client->user->server != server)
+			{
+				++it;
+				continue;
+			}
+
+			delete client;
+			it = this->clients.erase(it);
+		}
+
+		for (auto it = this->links.begin(); it != this->links.end(); )
+		{
+			if (it->second == server)
+				it = this->links.erase(it);
+			else
+				++it;
+		}
+	}
+
 	void OnUserQuit(User *u, const Anope::string &msg) override
 	{
-		if (!u || !this->IsBridgeClient(u))
+		if (!u)
 			return;
 
 		for (auto it = this->clients.begin(); it != this->clients.end(); ++it)
@@ -1062,11 +1101,11 @@ void BridgeType::Serialize(Serializable *obj, Serialize::Data &data) const
 
 	data.Store("protocol", bridge->protocol);
 	data.Store("irc-channel", bridge->irc_channel);
-	data.Store("guild", bridge->guild);
+	data.Store("space", bridge->space);
 	data.Store("foreign-channel", bridge->foreign_channel);
 	data.Store("nick-suffix", bridge->nick_suffix);
-	data.Store("webhook-id", bridge->endpoint_id);
-	data.Store("webhook-token", bridge->endpoint_token);
+	data.Store("endpoint-id", bridge->endpoint_id);
+	data.Store("endpoint-token", bridge->endpoint_token);
 
 	Anope::string reserved;
 	for (const auto &nick : bridge->reserved)
@@ -1079,13 +1118,24 @@ Serializable *BridgeType::Unserialize(Serializable *obj, Serialize::Data &data) 
 	if (!this->module)
 		return nullptr;
 
+	/* Rows written before the fields were named for any protocol used the
+	 * Discord names; they are read once and written back under the new
+	 * names on the next save. */
+	const auto load = [&data](const char *key, const char *legacy)
+	{
+		Anope::string value = data.Load(key);
+		if (value.empty())
+			value = data.Load(legacy);
+		return value;
+	};
+
 	const Anope::string irc_channel = data.Load("irc-channel");
-	const Anope::string guild = data.Load("guild");
+	const Anope::string space = load("space", "guild");
 	const Anope::string foreign_channel = data.Load("foreign-channel");
 
 	/* Rows which can not make a working bridge are skipped; the database
 	 * loader treats a null return as "ignore this record". */
-	if (irc_channel.empty() || guild.empty() || foreign_channel.empty())
+	if (irc_channel.empty() || space.empty() || foreign_channel.empty())
 		return nullptr;
 
 	Bridge *bridge;
@@ -1103,18 +1153,28 @@ Serializable *BridgeType::Unserialize(Serializable *obj, Serialize::Data &data) 
 	bridge->protocol = data.Load("protocol");
 	if (bridge->protocol.empty())
 		bridge->protocol = "discord";
+	if (!FindBridgeProtocol(bridge->protocol))
+		Log(this->module) << "BridgeServ: the bridge for " << irc_channel << " uses the unknown protocol " << bridge->protocol << "; it will not relay until that protocol is available.";
 
 	bridge->irc_channel = irc_channel;
-	bridge->guild = guild;
+	bridge->space = space;
 	bridge->foreign_channel = foreign_channel;
 	bridge->nick_suffix = data.Load("nick-suffix");
-	bridge->endpoint_id = data.Load("webhook-id");
-	bridge->endpoint_token = data.Load("webhook-token");
+	bridge->endpoint_id = load("endpoint-id", "webhook-id");
+	bridge->endpoint_token = load("endpoint-token", "webhook-token");
 
 	bridge->reserved.clear();
+	size_t invalid = 0;
 	spacesepstream reserved(data.Load("reserved"));
 	for (Anope::string nick; reserved.GetToken(nick); )
-		bridge->reserved.insert(nick);
+	{
+		if (nick.empty() || !IRCD || !IRCD->IsNickValid(nick))
+			++invalid;
+		else
+			bridge->reserved.insert(nick);
+	}
+	if (invalid)
+		Log(this->module) << "BridgeServ: dropped " << invalid << " invalid reserved nickname(s) from the record for " << irc_channel;
 
 	if (obj)
 		this->module->BridgesChanged();
@@ -1150,9 +1210,21 @@ static bool CheckAccess(CommandSource &source, const Anope::string &permission)
 	return false;
 }
 
+/** The identity an asynchronous listing is delivered back to: the UID where
+ * the IRCd has them, so that a nick change in the meantime does not lose the
+ * reply or deliver it to whoever took the nick.
+ */
+static Anope::string Requester(CommandSource &source)
+{
+	const User *u = source.GetUser();
+	if (u && !u->GetUID().empty())
+		return u->GetUID();
+	return source.GetNick();
+}
+
 /** Validates the space, channel, and suffix of a bridge. */
 static BridgeProtocol *CheckBridgeArgs(CommandSource &source, ModuleBridgeServ *module,
-	const Anope::string &guild, const Anope::string &channel, const Anope::string &suffix)
+	const Anope::string &space, const Anope::string &channel, const Anope::string &suffix)
 {
 	BridgeProtocol *protocol = module->DefaultProtocol();
 	if (!protocol)
@@ -1161,7 +1233,7 @@ static BridgeProtocol *CheckBridgeArgs(CommandSource &source, ModuleBridgeServ *
 		return nullptr;
 	}
 
-	if (!protocol->IsValidId(guild))
+	if (!protocol->IsValidId(space))
 	{
 		source.Reply(_("Invalid %s space ID."), protocol->GetName().c_str());
 		return nullptr;
@@ -1197,7 +1269,7 @@ void CommandBSAdd::Execute(CommandSource &source, const std::vector<Anope::strin
 		return;
 
 	const auto &irc_channel = params[0];
-	const auto &guild = params[1];
+	const auto &space = params[1];
 	const auto &foreign_channel = params[2];
 	const Anope::string suffix = params.size() > 3 ? params[3] : "";
 
@@ -1207,7 +1279,7 @@ void CommandBSAdd::Execute(CommandSource &source, const std::vector<Anope::strin
 		return;
 	}
 
-	auto *protocol = CheckBridgeArgs(source, this->module, guild, foreign_channel, suffix);
+	auto *protocol = CheckBridgeArgs(source, this->module, space, foreign_channel, suffix);
 	if (!protocol)
 		return;
 
@@ -1226,7 +1298,7 @@ void CommandBSAdd::Execute(CommandSource &source, const std::vector<Anope::strin
 	auto *bridge = new Bridge();
 	bridge->protocol = protocol->GetName();
 	bridge->irc_channel = irc_channel;
-	bridge->guild = guild;
+	bridge->space = space;
 	bridge->foreign_channel = foreign_channel;
 	bridge->nick_suffix = suffix;
 
@@ -1234,10 +1306,10 @@ void CommandBSAdd::Execute(CommandSource &source, const std::vector<Anope::strin
 	bridge->QueueUpdate();
 
 	Log(LOG_ADMIN, source, this) << "to bridge " << irc_channel << " to " << protocol->GetName()
-		<< " space " << guild << " channel " << foreign_channel
+		<< " space " << space << " channel " << foreign_channel
 		<< (suffix.empty() ? "" : " with nick suffix " + suffix);
 	source.Reply(_("Added bridge %s <-> %s space %s channel %s."), irc_channel.c_str(),
-		protocol->GetName().c_str(), guild.c_str(), foreign_channel.c_str());
+		protocol->GetName().c_str(), space.c_str(), foreign_channel.c_str());
 }
 
 bool CommandBSAdd::OnHelp(CommandSource &source, const Anope::string &subcommand)
@@ -1277,7 +1349,7 @@ void CommandBSSet::Execute(CommandSource &source, const std::vector<Anope::strin
 		return;
 
 	const auto &irc_channel = params[0];
-	const auto &guild = params[1];
+	const auto &space = params[1];
 	const auto &foreign_channel = params[2];
 	const Anope::string suffix = params.size() > 3 ? params[3] : "";
 
@@ -1288,7 +1360,7 @@ void CommandBSSet::Execute(CommandSource &source, const std::vector<Anope::strin
 		return;
 	}
 
-	auto *protocol = CheckBridgeArgs(source, this->module, guild, foreign_channel, suffix);
+	auto *protocol = CheckBridgeArgs(source, this->module, space, foreign_channel, suffix);
 	if (!protocol)
 		return;
 
@@ -1307,21 +1379,21 @@ void CommandBSSet::Execute(CommandSource &source, const std::vector<Anope::strin
 	}
 
 	bridge->protocol = protocol->GetName();
-	bridge->guild = guild;
+	bridge->space = space;
 	bridge->foreign_channel = foreign_channel;
 	bridge->nick_suffix = suffix;
 	bridge->QueueUpdate();
 
 	/* The clients of this bridge were named and grouped by the old space and
 	 * suffix, so they are taken down and come back under the new ones. */
-	this->module->PruneChannels();
+	this->module->RetireClients(bridge, "Bridge repointed");
 	this->module->BridgesChanged();
 
 	Log(LOG_ADMIN, source, this) << "to point " << irc_channel << " at " << protocol->GetName()
-		<< " space " << guild << " channel " << foreign_channel
+		<< " space " << space << " channel " << foreign_channel
 		<< (suffix.empty() ? "" : " with nick suffix " + suffix);
 	source.Reply(_("Updated bridge %s <-> %s space %s channel %s."), irc_channel.c_str(),
-		protocol->GetName().c_str(), guild.c_str(), foreign_channel.c_str());
+		protocol->GetName().c_str(), space.c_str(), foreign_channel.c_str());
 }
 
 bool CommandBSSet::OnHelp(CommandSource &source, const Anope::string &subcommand)
@@ -1331,7 +1403,9 @@ bool CommandBSSet::OnHelp(CommandSource &source, const Anope::string &subcommand
 	source.Reply(_(
 		"Re-points an existing bridge at a different space and channel, "
 		"and sets or clears its nickname suffix. Any delivery endpoint of "
-		"the previous channel is deleted and a new one is created."
+		"the previous channel is deleted and a new one is created. "
+		"Nicknames reserved under the previous settings stay reserved "
+		"until the bridge is deleted."
 	));
 	return true;
 }
@@ -1358,12 +1432,14 @@ void CommandBSDel::Execute(CommandSource &source, const std::vector<Anope::strin
 
 	const Anope::string irc_channel = bridge->irc_channel;
 	const size_t reserved = bridge->reserved.size();
-	this->module->DropBridge(bridge);
+	const size_t released = this->module->DropBridge(bridge);
 
 	Log(LOG_ADMIN, source, this) << "to remove the bridge for " << irc_channel;
 	source.Reply(_("Bridge removed."));
-	if (reserved)
-		source.Reply(_("%zu reserved nickname(s) have been released."), reserved);
+	if (reserved > released)
+		source.Reply(_("%zu reserved nickname(s) released, %zu still held by other bridges."), released, reserved - released);
+	else if (released)
+		source.Reply(_("%zu reserved nickname(s) released."), released);
 }
 
 bool CommandBSDel::OnHelp(CommandSource &source, const Anope::string &subcommand)
@@ -1415,7 +1491,7 @@ void CommandBSList::Execute(CommandSource &source, const std::vector<Anope::stri
 		ListFormatter::ListEntry entry;
 		entry["Channel"] = bridge->irc_channel;
 		entry["Network"] = bridge->protocol;
-		entry["Space"] = bridge->guild;
+		entry["Space"] = bridge->space;
 		entry["Remote channel"] = bridge->foreign_channel;
 		entry["Suffix"] = bridge->nick_suffix.empty() ? "-" : bridge->nick_suffix;
 		entry["Endpoint"] = bridge->endpoint_id.empty() ? _("no") : _("yes");
@@ -1466,7 +1542,7 @@ void CommandBSGuilds::Execute(CommandSource &source, const std::vector<Anope::st
 		return;
 	}
 
-	protocol->ListGuilds(source.GetNick(), source.service ? source.service->nick : "");
+	protocol->ListSpaces(Requester(source), source.service ? source.service->nick : "");
 }
 
 bool CommandBSGuilds::OnHelp(CommandSource &source, const Anope::string &subcommand)
@@ -1513,7 +1589,7 @@ void CommandBSChannels::Execute(CommandSource &source, const std::vector<Anope::
 		return;
 	}
 
-	protocol->ListChannels(params[0], source.GetNick(), source.service ? source.service->nick : "");
+	protocol->ListChannels(params[0], Requester(source), source.service ? source.service->nick : "");
 }
 
 bool CommandBSChannels::OnHelp(CommandSource &source, const Anope::string &subcommand)
