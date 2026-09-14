@@ -64,8 +64,9 @@ class BridgeClient final {
 public:
   Anope::string key;
   Anope::string user_id;
-  /* The display name the client was introduced for; a change retires
-   * the client so that the new name can be introduced. */
+  /* The display name the client currently carries; a change renames the
+   * client in place. The old nickname stays reserved for as long as the
+   * bridge exists. */
   Anope::string display;
   User *user = nullptr;
   std::set<Anope::string> chans;
@@ -364,7 +365,8 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   /* ------------------------------------------------------------------ */
 
   Anope::string MakeNick(const Anope::string &raw,
-                         const Anope::string &suffix) const {
+                         const Anope::string &suffix,
+                         const User *ignore = nullptr) const {
     /* Leave room for the suffix and for the uniquifying counter. */
     const size_t maxlen = IRCD->MaxNick ? IRCD->MaxNick : 31;
     const size_t reserved = suffix.length() + 3;
@@ -379,8 +381,10 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
       return "";
 
     const Anope::string candidate = nick;
-    for (unsigned counter = 2;
-         User::Find(nick, true) || !IRCD->IsNickValid(nick); ++counter) {
+    for (unsigned counter = 2;; ++counter) {
+      const User *held = User::Find(nick, true);
+      if ((!held || held == ignore) && IRCD->IsNickValid(nick))
+        break;
       if (counter > 99)
         return "";
 
@@ -427,12 +431,32 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
       if (client->display == display)
         return client;
 
-      /* The client was introduced under an old display name; it is
-       * retired so that a fresh one can carry the new name. The old
-       * nickname stays reserved for as long as the bridge exists. */
-      const bool synced =
-          Servers::GetUplink() && Servers::GetUplink()->IsSynced();
-      this->RemoveClient(client, "Display name changed", synced);
+      /* The remote user renamed themselves. The client is renamed in place
+       * rather than retired and re-introduced: quitting it made every
+       * display-name change show up on IRC as a QUIT followed by a JOIN.
+       * The old nickname stays reserved for as long as the bridge exists. */
+      if (!client->user) {
+        this->RemoveClient(client, "Display name changed",
+                           Servers::GetUplink() &&
+                               Servers::GetUplink()->IsSynced());
+      } else {
+        const Anope::string renamed =
+            this->MakeNick(display, bridge->nick_suffix, client->user);
+        if (renamed.empty()) {
+          Log(this) << "BridgeServ: unable to allocate an IRC nick for the "
+                    << "new display name of " << client->user->nick
+                    << "; keeping the current nick.";
+        } else if (!renamed.equals_ci(client->user->nick)) {
+          this->ReserveNick(bridge, renamed);
+          const Anope::string previous = client->user->nick;
+          IRCD->SendNickChange(client->user, renamed);
+          client->user->ChangeNick(renamed);
+          Log(this) << "BridgeServ: renamed pseudo client " << previous
+                    << " to " << renamed;
+        }
+        client->display = display;
+        return client;
+      }
     }
 
     Server *link = this->EnsureLink(protocol, bridge->space);
