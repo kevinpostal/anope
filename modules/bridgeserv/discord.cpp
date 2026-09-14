@@ -155,6 +155,24 @@ public:
   void Run() override;
 };
 
+class DiscordProtocol;
+
+/** Re-opens the Discord connection after it stopped.
+ *
+ * A one-shot timer: it is created by OnStopped and reschedules itself only
+ * through another OnStopped, so a connection which keeps failing backs off
+ * instead of hammering the gateway.
+ */
+class DiscordRetryTimer final : public Timer {
+  DiscordProtocol *protocol;
+
+public:
+  DiscordRetryTimer(Module *creator, time_t delay, DiscordProtocol *p)
+      : Timer(creator, delay), protocol(p) {}
+
+  bool Tick() override;
+};
+
 class DiscordProtocol final : public BridgeProtocol, public Pipe {
   dpp::cluster *cluster = nullptr;
   DiscordThread *thread = nullptr;
@@ -167,6 +185,17 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
   Anope::string webhook_suffix;
 
   bool connected = false;
+
+  /* The pending reconnect, and the delay the next one uses. Discord stops
+   * a connection for reasons which are none of our business — a rate
+   * limited gateway query at startup, a network blip, a gateway restart —
+   * and without a retry the bridge would relay nothing until an operator
+   * restarted services. */
+  DiscordRetryTimer *retry = nullptr;
+  time_t retry_delay = 0;
+  /* Set while the connection is being torn down on purpose, so an expected
+   * stop does not schedule a reconnect. */
+  bool stopping = false;
 
   /* ------------------------------------------------------------------ */
   /* Rendering (called on the Discord thread; touches no Anope state)   */
@@ -434,10 +463,19 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
 
     this->thread = new DiscordThread(this->cluster, this->mailbox);
     this->thread->Start();
+
+    /* Nothing else notices a connection which never becomes ready. */
+    this->ScheduleWatchdog();
   }
 
   void StopCluster() {
     this->connected = false;
+
+    /* An intentional teardown must not be mistaken for a connection which
+     * dropped, and a reconnect which is already scheduled has nothing left
+     * to reconnect to. */
+    this->stopping = true;
+    this->CancelRetry();
 
     if (this->cluster)
       this->cluster->shutdown();
@@ -450,6 +488,39 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
 
     delete this->cluster;
     this->cluster = nullptr;
+    this->stopping = false;
+  }
+
+  void CancelRetry() {
+    delete this->retry;
+    this->retry = nullptr;
+  }
+
+  /** Arms the watchdog which replaces a connection that never came up.
+   *
+   * A watchdog and not just a handler for a stopped connection, because
+   * the interesting failures never stop it: DPP fetches the gateway shard
+   * count on its own HTTPS thread and lets the exception escape there
+   * ("Uncaught exception thrown in HTTPS callback for GET
+   * /api/v10/gateway/bot"), so cluster::start() keeps waiting forever on a
+   * gateway which is never dialled. Both a rate limited and an
+   * unauthorised shard-count query land there — the first was hit on the
+   * live deploy and left the bridge relaying nothing with no further log.
+   */
+  void ScheduleWatchdog() {
+    if (this->stopping || this->token.empty() || this->retry)
+      return;
+
+    /* 30s of grace for the first connect (a healthy one takes about two),
+     * then 60s, 120s and every 5 minutes. The cap keeps a token which has
+     * been revoked from being retried forever at speed. */
+    if (this->retry_delay == 0)
+      this->retry_delay = 30;
+    else if (this->retry_delay < 300)
+      this->retry_delay = std::min<time_t>(this->retry_delay * 2, 300);
+
+    this->retry =
+        new DiscordRetryTimer(this->core->GetOwner(), this->retry_delay, this);
   }
 
   /* ------------------------------------------------------------------ */
@@ -659,6 +730,10 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
 
   void OnReady(uint32_t guilds) {
     this->connected = true;
+    /* The connection is good, so the next failure starts from the shortest
+     * delay again rather than from whatever this one had earned. */
+    this->retry_delay = 0;
+    this->CancelRetry();
     Log(this->core->GetOwner())
         << "BridgeServ: connected to Discord (" << guilds << " guild(s)).";
 
@@ -678,9 +753,46 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
     this->connected = false;
     Log(this->core->GetOwner())
         << "BridgeServ: the Discord connection stopped: " << error;
+    this->ScheduleWatchdog();
+  }
+
+  /** Replaces a connection which is not up. Called from the watchdog.
+   *
+   * A connection which came up is left alone: DPP resumes a gateway
+   * session by itself, and tearing a live cluster down here would drop
+   * every pseudo client for no reason.
+   */
+  void Reconnect() {
+    this->retry = nullptr;   /* the timer deletes itself after this tick */
+
+    if (this->connected || this->token.empty())
+      return;
+
+    /* The old cluster may still be sitting in start(), waiting on a
+     * gateway it never reached; the objects are ours to release, and a new
+     * cluster cannot be created while the old pointer is still set. */
+    const bool was_stopping = this->stopping;
+    this->stopping = true;
+    if (this->cluster || this->thread) {
+      if (this->cluster)
+        this->cluster->shutdown();
+      if (this->thread) {
+        this->thread->Join();
+        delete this->thread;
+        this->thread = nullptr;
+      }
+      delete this->cluster;
+      this->cluster = nullptr;
+    }
+    this->stopping = was_stopping;
+
+    Log(this->core->GetOwner())
+        << "BridgeServ: the Discord connection never came up; reconnecting.";
+    this->StartCluster();
   }
 
   friend class DiscordThread;
+  friend class DiscordRetryTimer;
 
 public:
   explicit DiscordProtocol(BridgeCore *c)
@@ -984,6 +1096,11 @@ void DiscordThread::Run() {
     this->mailbox->Post(
         [error](DiscordProtocol *protocol) { protocol->OnStopped(error); });
   }
+}
+
+bool DiscordRetryTimer::Tick() {
+  this->protocol->Reconnect();
+  return false;
 }
 
 BridgeProtocol *CreateDiscordProtocol(BridgeCore *core) {
