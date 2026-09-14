@@ -27,7 +27,6 @@
 #include <dpp/webhook.h>
 
 #include <algorithm>
-#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
@@ -148,43 +147,12 @@ public:
 class DiscordThread final : public Thread {
   dpp::cluster *cluster;
   std::shared_ptr<Mailbox> mailbox;
-  /* Set as the very last thing Run does. A cluster must never be replaced
-   * while its thread is still inside DPP's event loop: two live clusters
-   * parse gateway JSON concurrently, and constructing the named
-   * std::locale which DPP's timestamp parser uses is not safe to do from
-   * two threads at once on every platform (it segfaulted services on
-   * musl). */
-  std::atomic<bool> finished{false};
 
 public:
   DiscordThread(dpp::cluster *c, std::shared_ptr<Mailbox> m)
       : cluster(c), mailbox(std::move(m)) {}
 
-  bool Finished() const { return this->finished.load(); }
-
   void Run() override;
-};
-
-class DiscordProtocol;
-
-/** Replaces a Discord connection which never came up.
- *
- * One-shot: Tick always returns false, so TimerManager owns the object and
- * deletes it after it fires. The protocol therefore never deletes a timer
- * it has handed over — it disarms it instead, and a disarmed timer just
- * retires on its next tick. (Deleting one from the protocol segfaulted the
- * services process on the live network.)
- */
-class DiscordRetryTimer final : public Timer {
-  DiscordProtocol *protocol;
-
-public:
-  DiscordRetryTimer(Module *creator, time_t delay, DiscordProtocol *p)
-      : Timer(creator, delay), protocol(p) {}
-
-  void Disarm() { this->protocol = nullptr; }
-
-  bool Tick() override;
 };
 
 class DiscordProtocol final : public BridgeProtocol, public Pipe {
@@ -199,19 +167,6 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
   Anope::string webhook_suffix;
 
   bool connected = false;
-
-  /* The pending watchdog and the delay the next one uses. Discord fails a
-   * connect for reasons which are none of our business — a rate limited
-   * gateway query at startup, a network blip, a gateway restart. */
-  DiscordRetryTimer *retry = nullptr;
-  time_t retry_delay = 0;
-  /* Set while the connection is being torn down on purpose, so an expected
-   * stop does not arm the watchdog. */
-  bool stopping = false;
-  /* Whether services may exit so that its supervisor gives the Discord
-   * link a fresh process. Off by default: nothing in Anope may decide on
-   * its own that quitting is acceptable. */
-  bool restart_on_failure = false;
 
   /* ------------------------------------------------------------------ */
   /* Rendering (called on the Discord thread; touches no Anope state)   */
@@ -479,19 +434,10 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
 
     this->thread = new DiscordThread(this->cluster, this->mailbox);
     this->thread->Start();
-
-    /* Nothing else notices a connection which never becomes ready. */
-    this->ScheduleWatchdog();
   }
 
   void StopCluster() {
     this->connected = false;
-
-    /* An intentional teardown must not be mistaken for a connection which
-     * dropped, and a reconnect which is already scheduled has nothing left
-     * to reconnect to. */
-    this->stopping = true;
-    this->CancelRetry();
 
     if (this->cluster)
       this->cluster->shutdown();
@@ -504,46 +450,6 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
 
     delete this->cluster;
     this->cluster = nullptr;
-    this->stopping = false;
-  }
-
-  /** Lets a pending watchdog retire without acting.
-   *
-   * It is not deleted: TimerManager owns every armed timer and deletes it
-   * after its tick, and deleting one from here crashed services on the
-   * live network. A disarmed timer costs one no-op tick.
-   */
-  void CancelRetry() {
-    if (this->retry)
-      this->retry->Disarm();
-    this->retry = nullptr;
-  }
-
-  /** Arms the watchdog which replaces a connection that never came up.
-   *
-   * A watchdog and not just a handler for a stopped connection, because
-   * the interesting failures never stop it: DPP fetches the gateway shard
-   * count on its own HTTPS thread and lets the exception escape there
-   * ("Uncaught exception thrown in HTTPS callback for GET
-   * /api/v10/gateway/bot"), so cluster::start() keeps waiting forever on a
-   * gateway which is never dialled. Both a rate limited and an
-   * unauthorised shard-count query land there — the first was hit on the
-   * live deploy and left the bridge relaying nothing with no further log.
-   */
-  void ScheduleWatchdog() {
-    if (this->stopping || this->token.empty() || this->retry)
-      return;
-
-    /* 30s of grace for the first connect (a healthy one takes about two),
-     * then 60s, 120s and every 5 minutes. The cap keeps a token which has
-     * been revoked from being retried forever at speed. */
-    if (this->retry_delay == 0)
-      this->retry_delay = 30;
-    else if (this->retry_delay < 300)
-      this->retry_delay = std::min<time_t>(this->retry_delay * 2, 300);
-
-    this->retry =
-        new DiscordRetryTimer(this->core->GetOwner(), this->retry_delay, this);
   }
 
   /* ------------------------------------------------------------------ */
@@ -753,10 +659,6 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
 
   void OnReady(uint32_t guilds) {
     this->connected = true;
-    /* The connection is good, so the next failure starts from the shortest
-     * delay again rather than from whatever this one had earned. */
-    this->retry_delay = 0;
-    this->CancelRetry();
     Log(this->core->GetOwner())
         << "BridgeServ: connected to Discord (" << guilds << " guild(s)).";
 
@@ -776,55 +678,9 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
     this->connected = false;
     Log(this->core->GetOwner())
         << "BridgeServ: the Discord connection stopped: " << error;
-    this->ScheduleWatchdog();
-  }
-
-  /** Reports, and optionally recovers from, a connection which never came
-   * up. Called from the watchdog.
-   *
-   * A connection which came up is left alone: DPP resumes a gateway
-   * session by itself.
-   *
-   * The cluster is deliberately NOT replaced in place. DPP gives no way to
-   * do it safely: cluster::shutdown() does not make cluster::start() with
-   * st_wait return, so the old event loop keeps running, and starting a
-   * second cluster beside it has two threads decoding gateway JSON at
-   * once — which crashed services on musl, where constructing the named
-   * std::locale of DPP's timestamp parser is not thread safe (SIGSEGV in
-   * strchr under std::locale::locale, from
-   * dpp::guild_member::fill_from_json on GUILD_CREATE). Verified on the
-   * rig: after a failed connect the DPP thread never finishes, so an
-   * in-place retry can only either crash or wait forever.
-   *
-   * Only a fresh process recovers. Where something supervises services
-   * (a container restart policy, systemd), `restartonfailure = yes` lets
-   * it do that; otherwise the failure is logged for an operator and the
-   * bridge keeps serving its stored bridges with the Discord link down.
-   */
-  void Reconnect() {
-    this->retry = nullptr;   /* TimerManager deletes it after this tick */
-
-    if (this->connected || this->token.empty())
-      return;
-
-    if (this->restart_on_failure) {
-      Log(this->core->GetOwner())
-          << "BridgeServ: the Discord connection never came up; shutting "
-             "down so that services is restarted with a fresh one.";
-      Anope::Quitting = true;
-      return;
-    }
-
-    Log(this->core->GetOwner())
-        << "BridgeServ: the Discord connection never came up and cannot be "
-           "restarted in place; restart services to retry. Set "
-           "bridgeserv:restartonfailure to have services exit for its "
-           "supervisor instead.";
-    this->ScheduleWatchdog();
   }
 
   friend class DiscordThread;
-  friend class DiscordRetryTimer;
 
 public:
   explicit DiscordProtocol(BridgeCore *c)
@@ -877,11 +733,6 @@ public:
     this->webhook_name = name;
     this->webhook_suffix = StripControl(
         block.Get<const Anope::string>("webhooksuffix", " (IRC)").str());
-
-    /* Whether services may exit when the Discord link never comes up, so
-     * that a supervisor restarts it with a fresh process. There is no
-     * in-process recovery: see Reconnect. */
-    this->restart_on_failure = block.Get<bool>("restartonfailure");
 
     const Anope::string new_token = block.Get<const Anope::string>("token");
     if (new_token != this->token || !this->cluster) {
@@ -1125,6 +976,30 @@ public:
   }
 };
 
+/* A connection which never comes up cannot be recovered from here, and the
+ * module deliberately does not try. Live running found all three halves of
+ * the problem:
+ *
+ *   * DPP fetches the gateway shard count on its own HTTPS thread and lets
+ *     a failure escape there ("Uncaught exception thrown in HTTPS callback
+ *     for GET /api/v10/gateway/bot"), so start() below neither returns nor
+ *     throws: nothing notices, and BridgeServ LIST reports
+ *     "discord: offline" with no further log. A rate limited query is
+ *     routine — it happens whenever the process restarts twice in quick
+ *     succession — and an unauthorised one lands in the same place.
+ *   * cluster::shutdown() does not make start(st_wait) return, so the dead
+ *     cluster's thread never finishes and cannot be joined.
+ *   * Starting a replacement cluster beside it puts two threads in DPP's
+ *     JSON decoding at once, which segfaults on musl: the named
+ *     std::locale that DPP's timestamp parser constructs is not thread
+ *     safe there (SIGSEGV in strchr under std::locale::locale, reached
+ *     from dpp::guild_member::fill_from_json on GUILD_CREATE).
+ *
+ * Only a fresh process recovers, so recovery belongs to whatever
+ * supervises services (a container restart policy, systemd). The fix for
+ * the first point belongs in DPP, which should retry or report the
+ * shard-count fetch rather than dropping the exception.
+ */
 void DiscordThread::Run() {
   try {
     this->cluster->start(dpp::st_wait);
@@ -1133,19 +1008,6 @@ void DiscordThread::Run() {
     this->mailbox->Post(
         [error](DiscordProtocol *protocol) { protocol->OnStopped(error); });
   }
-
-  /* Last: the protocol reads this to know the cluster is no longer being
-   * driven and may be replaced. */
-  this->finished.store(true);
-}
-
-bool DiscordRetryTimer::Tick() {
-  /* Disarmed while it was pending: the connection came up, or the module
-   * tore the link down. Retire without touching the protocol, which may
-   * no longer want anything to do with this timer. */
-  if (this->protocol)
-    this->protocol->Reconnect();
-  return false;
 }
 
 BridgeProtocol *CreateDiscordProtocol(BridgeCore *core) {
