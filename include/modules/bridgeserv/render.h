@@ -16,7 +16,9 @@
 
 #include <cctype>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <string>
 #include <vector>
@@ -72,6 +74,55 @@ namespace BridgeServ::Text
 				len = lead - 1;
 		}
 		return str.substr(0, len);
+	}
+
+	/** Truncates a string to at most the given number of Unicode code
+	 * points. Discord's message limits count characters, not bytes.
+	 * @param str The string to truncate.
+	 * @param maxchars The maximum number of code points to keep.
+	 * @return The truncated string.
+	 */
+	inline std::string TruncateCodePoints(const std::string &str, size_t maxchars)
+	{
+		size_t chars = 0;
+		for (size_t pos = 0; pos < str.length(); ++pos)
+		{
+			// Every code point starts with exactly one non-continuation byte.
+			if ((static_cast<unsigned char>(str[pos]) & 0xc0) == 0x80)
+				continue;
+			if (chars == maxchars)
+				return str.substr(0, pos);
+			++chars;
+		}
+		return str;
+	}
+
+	/** Escapes a Markdown block marker at the start of a line.
+	 *
+	 * Inline escaping covers the emphasis characters but not headings,
+	 * list items, or quotes, so a message starting with "# " or "1. "
+	 * would otherwise be rendered by Discord as a block.
+	 *
+	 * @param str The message text.
+	 * @return The text with a leading block marker escaped.
+	 */
+	inline std::string EscapeLineStart(const std::string &str)
+	{
+		if (str.empty())
+			return str;
+
+		bool marker = str[0] == '#' || str[0] == '-' || str[0] == '+';
+		if (!marker && std::isdigit(static_cast<unsigned char>(str[0])))
+		{
+			size_t pos = 1;
+			while (pos < str.length() && std::isdigit(static_cast<unsigned char>(str[pos])))
+				++pos;
+			marker = pos < str.length() && str[pos] == '.';
+		}
+
+		if (!marker)
+			return str;
+		return "\\" + str;
 	}
 
 	namespace Detail
@@ -155,6 +206,15 @@ namespace BridgeServ::Text
 				{
 					out.push_back('\n');
 					line_start = true;
+					++pos;
+					continue;
+				}
+
+				// Only a handful of characters can open a span or an escape;
+				// skip the per-delimiter searches for everything else.
+				if (str[pos] == '\0' || std::strchr("`|*_~\\", str[pos]) == nullptr)
+				{
+					out.push_back(str[pos]);
 					++pos;
 					continue;
 				}
@@ -417,5 +477,36 @@ namespace BridgeServ::Text
 			pos = eol + 1;
 		}
 		return lines;
+	}
+
+	/** Formats a Unix timestamp as a UTC time.
+	 * @param unix_seconds The timestamp as a decimal string.
+	 * @return The time as "YYYY-MM-DD HH:MM UTC", or an empty string if the
+	 *         timestamp is not a non-negative integer.
+	 */
+	inline std::string FormatUnixTime(const std::string &unix_seconds)
+	{
+		if (unix_seconds.empty() || !std::isdigit(static_cast<unsigned char>(unix_seconds[0])))
+			return "";
+
+		char *end = nullptr;
+		const long long when = std::strtoll(unix_seconds.c_str(), &end, 10);
+		if (*end || when < 0)
+			return "";
+
+		const std::time_t raw = static_cast<std::time_t>(when);
+		std::tm parts = { };
+#ifdef _WIN32
+		if (gmtime_s(&parts, &raw))
+			return "";
+#else
+		if (!gmtime_r(&raw, &parts))
+			return "";
+#endif
+
+		char buf[32];
+		if (!std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M UTC", &parts))
+			return "";
+		return buf;
 	}
 }
