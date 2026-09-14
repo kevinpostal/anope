@@ -71,6 +71,9 @@ public:
   User *user = nullptr;
   std::set<Anope::string> chans;
   time_t last_active = Anope::CurTime;
+  /* Whether the client is currently marked away on IRC, so that an
+   * unchanged presence update does not put AWAY on the wire again. */
+  bool away = false;
 };
 
 class BridgeType final : public Serialize::Type {
@@ -520,6 +523,122 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
     chan->JoinUser(client->user, nullptr);
     IRCD->SendJoin(client->user, chan, nullptr);
     client->chans.insert(chan->name);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Roster and presence                                                */
+  /* ------------------------------------------------------------------ */
+
+  /** Puts a pseudo client into, or back out of, the IRC away state.
+   *
+   * InspIRCd and every other IRCd Anope speaks take AWAY from the client
+   * itself: "<ts> :<reason>" to go away, no parameters to come back.
+   */
+  void SetClientAway(BridgeClient *client, bool away,
+                     const Anope::string &reason) {
+    if (!client->user || client->away == away)
+      return;
+
+    client->away = away;
+    if (!Servers::GetUplink() || !Servers::GetUplink()->IsSynced())
+      return;
+
+    if (away) {
+      const Anope::string text = reason.empty() ? "Away" : reason;
+      Uplink::Send(client->user, "AWAY", Anope::CurTime, text);
+      client->user->SetAway(text, Anope::CurTime);
+    } else {
+      Uplink::Send(client->user, "AWAY");
+      client->user->SetAway();
+    }
+  }
+
+  /** The bridges of one space, in the order they were configured. */
+  std::vector<Bridge *> BridgesOf(const Anope::string &protocol,
+                                  const Anope::string &space) const {
+    std::vector<Bridge *> found;
+    for (auto *bridge : this->bridges) {
+      if (bridge->protocol.equals_ci(protocol) &&
+          bridge->space.equals_ci(space) && !bridge->irc_channel.empty())
+        found.push_back(bridge);
+    }
+    return found;
+  }
+
+  /** The client a bridge holds for a remote user, or null. */
+  BridgeClient *FindClient(Bridge *bridge, const Anope::string &user_id) {
+    BridgeProtocol *protocol = bridge->GetProtocol();
+    if (!protocol)
+      return nullptr;
+
+    const Anope::string key = LinkKey(protocol, bridge->space) + "/" +
+                              bridge->nick_suffix + "/" + user_id;
+    const auto it = this->clients.find(key);
+    return it == this->clients.end() ? nullptr : it->second;
+  }
+
+  void SyncRoster(const Anope::string &protocol, const Anope::string &space,
+                  const std::vector<BridgeMember> &members) override {
+    if (!IRCD || members.empty())
+      return;
+
+    /* Introducing clients before the uplink has finished bursting would
+     * put JOINs on a link which is not ready for them; the roster is
+     * re-sent on every guild create, so dropping this one is safe. */
+    if (!Servers::GetUplink() || !Servers::GetUplink()->IsSynced())
+      return;
+
+    size_t introduced = 0;
+    for (auto *bridge : this->BridgesOf(protocol, space)) {
+      for (const auto &member : members) {
+        if (member.user_id.empty())
+          continue;
+
+        const bool existing = this->FindClient(bridge, member.user_id);
+        BridgeClient *client =
+            this->EnsureClient(bridge, member.user_id, member.display);
+        if (!client || !client->user)
+          continue;
+
+        if (!existing)
+          ++introduced;
+
+        this->EnsureJoin(client, bridge->irc_channel);
+        if (member.presence_known)
+          this->SetClientAway(client, member.away, member.away_reason);
+      }
+    }
+
+    if (introduced)
+      Log(this) << "BridgeServ: joined " << introduced
+                << " roster member(s) of " << protocol << " space " << space;
+  }
+
+  void RemoveMember(const Anope::string &protocol, const Anope::string &space,
+                    const Anope::string &user_id) override {
+    if (!IRCD || user_id.empty())
+      return;
+
+    const bool synced =
+        Servers::GetUplink() && Servers::GetUplink()->IsSynced();
+    for (auto *bridge : this->BridgesOf(protocol, space)) {
+      BridgeClient *client = this->FindClient(bridge, user_id);
+      if (client)
+        this->RemoveClient(client, "Left the bridged space", synced);
+    }
+  }
+
+  void SetPresence(const Anope::string &protocol, const Anope::string &space,
+                   const Anope::string &user_id, bool away,
+                   const Anope::string &reason) override {
+    if (!IRCD || user_id.empty())
+      return;
+
+    for (auto *bridge : this->BridgesOf(protocol, space)) {
+      BridgeClient *client = this->FindClient(bridge, user_id);
+      if (client)
+        this->SetClientAway(client, away, reason);
+    }
   }
 
   void PartClient(BridgeClient *client, const Anope::string &channel_name,
@@ -1025,6 +1144,12 @@ public:
     }
 
     this->BridgesChanged();
+
+    /* The bridged networks may already have handed over their rosters
+     * while the uplink was still bursting, when nothing could be joined
+     * yet; this is the first moment the population can be put on IRC. */
+    for (auto *protocol : this->protocols)
+      protocol->RefreshRoster();
   }
 
   void OnServerQuit(Server *server) override {
