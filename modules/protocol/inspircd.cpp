@@ -464,7 +464,13 @@ public:
 
 	void SendClientIntroduction(User *u) override
 	{
-		Uplink::Send("UID", u->GetUID(), u->timestamp, u->nick, u->host, u->host, u->GetIdent(), u->GetIdent(),
+		/* The introduction is sent from the server the user belongs to, which
+		 * is services itself for its own clients but a services-created link
+		 * for the pseudo clients of a bridged network. The IRCd attributes
+		 * the user to the source of this message, so sending every UID from
+		 * services would put those clients on services instead.
+		 */
+		Uplink::Send(u->server, "UID", u->GetUID(), u->timestamp, u->nick, u->host, u->host, u->GetIdent(), u->GetIdent(),
 			"0.0.0.0", u->timestamp, "+" + u->GetModes(), u->realname);
 
 		if (u->GetModes().find('o') != Anope::string::npos)

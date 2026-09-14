@@ -976,6 +976,30 @@ public:
   }
 };
 
+/* A connection which never comes up cannot be recovered from here, and the
+ * module deliberately does not try. Live running found all three halves of
+ * the problem:
+ *
+ *   * DPP fetches the gateway shard count on its own HTTPS thread and lets
+ *     a failure escape there ("Uncaught exception thrown in HTTPS callback
+ *     for GET /api/v10/gateway/bot"), so start() below neither returns nor
+ *     throws: nothing notices, and BridgeServ LIST reports
+ *     "discord: offline" with no further log. A rate limited query is
+ *     routine — it happens whenever the process restarts twice in quick
+ *     succession — and an unauthorised one lands in the same place.
+ *   * cluster::shutdown() does not make start(st_wait) return, so the dead
+ *     cluster's thread never finishes and cannot be joined.
+ *   * Starting a replacement cluster beside it puts two threads in DPP's
+ *     JSON decoding at once, which segfaults on musl: the named
+ *     std::locale that DPP's timestamp parser constructs is not thread
+ *     safe there (SIGSEGV in strchr under std::locale::locale, reached
+ *     from dpp::guild_member::fill_from_json on GUILD_CREATE).
+ *
+ * Only a fresh process recovers, so recovery belongs to whatever
+ * supervises services (a container restart policy, systemd). The fix for
+ * the first point belongs in DPP, which should retry or report the
+ * shard-count fetch rather than dropping the exception.
+ */
 void DiscordThread::Run() {
   try {
     this->cluster->start(dpp::st_wait);

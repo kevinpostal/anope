@@ -178,6 +178,11 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
    * "<protocol>/<space id>". */
   std::map<Anope::string, Server *> links;
 
+  /* The counter which pseudo client UIDs are allocated from. The UIDs of
+   * these clients belong to their link, not to services, so they cannot
+   * come from IRCDProto::UID_Retrieve. */
+  unsigned long uid_counter = 0;
+
   /* The pseudo clients of bridged networks, keyed by BridgeClient::key. */
   std::map<Anope::string, BridgeClient *> clients;
 
@@ -247,6 +252,41 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
     this->links[key] = link;
     Log(this) << "BridgeServ: introduced bridge link " << name;
     return link;
+  }
+
+  /** Allocates a UID for a pseudo client of a bridge link.
+   *
+   * The IRCd attributes a user to the server whose SID prefixes its UID, so
+   * a client introduced with a UID from IRCDProto::UID_Retrieve, which is
+   * always prefixed with the SID of services itself, would appear on
+   * services instead of behind the link of its space.
+   */
+  Anope::string MakeUID(Server *link) {
+    if (!IRCD || !IRCD->RequiresID)
+      return "";
+
+    const Anope::string &sid = link->GetSID();
+    if (sid.empty())
+      return IRCD->UID_Retrieve();
+
+    /* Six letters, which is what every UID capable IRCd accepts, taken
+     * from a counter and checked so that a reused counter after a rehash
+     * cannot collide with a client which is still online. */
+    for (unsigned tries = 0; tries < 1000; ++tries) {
+      unsigned long n = this->uid_counter++;
+      char suffix[7];
+      for (int i = 5; i >= 0; --i) {
+        suffix[i] = static_cast<char>('A' + (n % 26));
+        n /= 26;
+      }
+      suffix[6] = '\0';
+
+      const Anope::string uid = sid + suffix;
+      if (!User::Find(uid))
+        return uid;
+    }
+
+    return "";
   }
 
   /** Whether a user is one of our pseudo clients. */
@@ -415,7 +455,7 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
         Anope::Format("%s (%s)", display.c_str(), protocol->GetName().c_str());
     User *user = User::OnIntroduce(
         nick, this->MakeIdent(user_id), protocol->GetDomain(), "", "", link,
-        realname, Anope::CurTime, "", IRCD->UID_Retrieve(), nullptr);
+        realname, Anope::CurTime, "", this->MakeUID(link), nullptr);
     if (!user) {
       /* The nick or UID collided with a real user; both sides have been
        * killed by the factory, so there is nobody to relay as. The
