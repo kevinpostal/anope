@@ -157,11 +157,13 @@ public:
 
 class DiscordProtocol;
 
-/** Re-opens the Discord connection after it stopped.
+/** Replaces a Discord connection which never came up.
  *
- * A one-shot timer: it is created by OnStopped and reschedules itself only
- * through another OnStopped, so a connection which keeps failing backs off
- * instead of hammering the gateway.
+ * One-shot: Tick always returns false, so TimerManager owns the object and
+ * deletes it after it fires. The protocol therefore never deletes a timer
+ * it has handed over — it disarms it instead, and a disarmed timer just
+ * retires on its next tick. (Deleting one from the protocol segfaulted the
+ * services process on the live network.)
  */
 class DiscordRetryTimer final : public Timer {
   DiscordProtocol *protocol;
@@ -169,6 +171,8 @@ class DiscordRetryTimer final : public Timer {
 public:
   DiscordRetryTimer(Module *creator, time_t delay, DiscordProtocol *p)
       : Timer(creator, delay), protocol(p) {}
+
+  void Disarm() { this->protocol = nullptr; }
 
   bool Tick() override;
 };
@@ -491,8 +495,15 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
     this->stopping = false;
   }
 
+  /** Lets a pending watchdog retire without acting.
+   *
+   * It is not deleted: TimerManager owns every armed timer and deletes it
+   * after its tick, and deleting one from here crashed services on the
+   * live network. A disarmed timer costs one no-op tick.
+   */
   void CancelRetry() {
-    delete this->retry;
+    if (this->retry)
+      this->retry->Disarm();
     this->retry = nullptr;
   }
 
@@ -1099,7 +1110,11 @@ void DiscordThread::Run() {
 }
 
 bool DiscordRetryTimer::Tick() {
-  this->protocol->Reconnect();
+  /* Disarmed while it was pending: the connection came up, or the module
+   * tore the link down. Retire without touching the protocol, which may
+   * no longer want anything to do with this timer. */
+  if (this->protocol)
+    this->protocol->Reconnect();
   return false;
 }
 
