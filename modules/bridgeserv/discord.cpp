@@ -287,20 +287,49 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
       const size_t shown = std::min<size_t>(msg.attachments.size(), 4);
       for (size_t idx = 0; idx < shown; ++idx) {
         const auto &attachment = msg.attachments[idx];
-        text += " [" + attachment.filename + ": " + attachment.url + "]";
+        /* Media is labelled by what it is; anything else by its name. */
+        const std::string &type = attachment.content_type;
+        if (type.compare(0, 6, "image/") == 0)
+          text += " [image: " + attachment.url + "]";
+        else if (type.compare(0, 6, "video/") == 0)
+          text += " [video: " + attachment.url + "]";
+        else if (type.compare(0, 6, "audio/") == 0)
+          text += " [audio: " + attachment.url + "]";
+        else
+          text += " [file: " + attachment.filename + " " + attachment.url + "]";
       }
       if (msg.attachments.size() > shown)
         text +=
             " [+" + std::to_string(msg.attachments.size() - shown) + " more]";
     }
 
-    for (const auto &sticker : msg.stickers)
-      text += " [sticker: " + sticker.name + "]";
+    /* A sticker is an image the CDN serves by id; a Lottie sticker is a
+     * vector animation with no image form, so only its name is shown. */
+    for (const auto &sticker : msg.stickers) {
+      text += " [sticker: " + sticker.name;
+      switch (sticker.format_type) {
+      case dpp::sf_png:
+      case dpp::sf_apng:
+        text += " https://media.discordapp.net/stickers/" + sticker.id.str() + ".png";
+        break;
+      case dpp::sf_gif:
+        text += " https://media.discordapp.net/stickers/" + sticker.id.str() + ".gif";
+        break;
+      default:
+        break;
+      }
+      text += "]";
+    }
 
-    /* An embed is only interesting when there is nothing else to show;
-     * most embeds are just an unfurled link which is in the content. */
-    if (text.empty() && !msg.embeds.empty()) {
-      const auto &embed = msg.embeds.front();
+    /* A rich embed is bot output which has no other representation, so
+     * it is always rendered. Every other kind (link, image, video, gifv,
+     * article) is Discord's automatic preview of a URL which is already
+     * in the content, so those are only shown when there is nothing
+     * else. */
+    for (const auto &embed : msg.embeds) {
+      if (embed.type != "rich" && !text.empty())
+        continue;
+
       std::string summary = embed.title;
       if (!embed.description.empty())
         summary += (summary.empty() ? "" : " \xe2\x80\x94 ") +
@@ -311,8 +340,9 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
         summary += " [" + embed.fields[idx].name + ": " +
                    Text::TruncateCodePoints(embed.fields[idx].value, 100) + "]";
 
-      if (!summary.empty())
-        text = "[embed] " + render(summary);
+      if (summary.empty())
+        continue;
+      text += (text.empty() ? "" : "\n") + std::string("[embed] ") + render(summary);
     }
 
     /* A forwarded message carries its content in a snapshot. */
@@ -327,12 +357,6 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
             (text.empty() ? "" : "\n") + std::string("(forwarded) ") + content;
       }
     }
-
-    /* A forward references the original message too, but is not a reply
-     * to it. */
-    if (!text.empty() && msg.message_reference.message_id &&
-        !msg.has_snapshot())
-      text.insert(0, "(reply) ");
 
     /* Carriage returns and NULs can not be sent to IRC; newlines are
      * handled by the line splitter when the message is relayed. */
@@ -389,6 +413,20 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
     relay.user_id = msg.author.id.str();
     relay.msg_id = msg.id.str();
     relay.edit = edit;
+
+    /* A forward references the original message too, but is not a reply
+     * to it. */
+    if (msg.message_reference.message_id &&
+        msg.message_reference.type == dpp::mrt_default && !msg.has_snapshot())
+      relay.reply_to = msg.message_reference.message_id.str();
+
+    /* A message in a thread of the bridged channel is relayed into the
+     * same IRC channel, labelled with the thread it came from. */
+    if (msg.channel_id.str() != channel_id) {
+      relay.thread = msg.channel_id.str();
+      if (const auto *thread = dpp::find_channel(msg.channel_id))
+        relay.thread_name = thread->name;
+    }
 
     std::string display = msg.member.get_nickname();
     if (display.empty())

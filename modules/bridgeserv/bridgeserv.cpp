@@ -862,11 +862,28 @@ public:
     const size_t budget =
         Relay::PayloadBudget(source_len, bridge->irc_channel.length());
 
+    /* Visible markers for clients without the reply tag: what the message
+     * answers and the thread it came from, then the edit marker, so a
+     * line reads "(edit) (reply to X) [thread] text". */
+    std::string prefix;
+    if (!msg.reply_to.empty()) {
+      Anope::string author, excerpt, thread;
+      if (this->QuotedMessage(msg.reply_to, author, excerpt, thread) &&
+          !author.empty())
+        prefix += "(reply to " + author.str() + ") ";
+      else
+        prefix += "(reply) ";
+    }
+    if (!msg.thread_name.empty())
+      prefix += "[" + msg.thread_name.str() + "] ";
+    if (msg.edit)
+      prefix.insert(0, "(edit) ");
+
     std::string text = msg.text.str();
-    if (msg.edit) {
+    if (!prefix.empty()) {
       const size_t at = text.find_first_not_of('\n');
       if (at != std::string::npos)
-        text.insert(at, "(edit) ");
+        text.insert(at, prefix);
     }
     const auto wire = Relay::SplitForWire(text, budget, this->max_lines);
 
