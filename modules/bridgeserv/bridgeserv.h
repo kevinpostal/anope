@@ -259,6 +259,14 @@ public:
     (void)add;
   }
 
+  /** Tells the remote channel of a bridge about something which happened
+   * on the IRC side (a nick change, a topic, a kick). The text is literal
+   * and comes from the service, not from a user. */
+  virtual void Notice(Bridge *bridge, const Anope::string &text) {
+    (void)bridge;
+    (void)text;
+  }
+
   /** Called when the set of bridges has changed in any way. */
   virtual void OnBridgesChanged() {}
 

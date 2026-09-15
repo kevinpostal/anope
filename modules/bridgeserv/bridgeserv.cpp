@@ -185,6 +185,7 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   bool relay_deletes = false;
   bool relay_reactions = true;
   bool relay_typing = true;
+  std::set<Anope::string, ci::less> relay_events;
 
   std::vector<Bridge *> bridges;
 
@@ -1272,6 +1273,23 @@ public:
     this->relay_typing = block.Get<bool>("relaytyping", "yes");
     this->relay_reactions = block.Get<bool>("relayreactions", "yes");
 
+    /* Which IRC channel events are told to the remote network. */
+    this->relay_events.clear();
+    static const std::set<Anope::string, ci::less> known = {
+        "join", "part", "quit", "nick", "topic", "kick"};
+    commasepstream events(block.Get<const Anope::string>("relayevents",
+                                                          "nick,topic,kick"));
+    for (Anope::string token; events.GetToken(token);) {
+      token.trim();
+      if (token.empty())
+        continue;
+      if (known.count(token))
+        this->relay_events.insert(token);
+      else
+        Log(this) << "BridgeServ: unknown relayevents token \"" << token
+                  << "\" ignored.";
+    }
+
     /* Zero disables reaping; anything else is at least a minute so the
      * reaper can not quit a client which just spoke. */
     const time_t idle = block.Get<time_t>("useridle", "1h");
@@ -1352,6 +1370,74 @@ public:
     }
   }
 
+  /* ------------------------------------------------------------------ */
+  /* IRC channel events                                                 */
+  /* ------------------------------------------------------------------ */
+
+  /** Whether what a user does on IRC is relayed as an event: services
+   * clients and our own pseudo clients are not. */
+  bool RelaysEventsFor(const User *u) const {
+    return u && u != this->GetClient() && u->server != Me &&
+           u->server->IsSynced() && !this->IsBridgeClient(u);
+  }
+
+  /** Sends an event about an IRC channel to the network it is bridged to,
+   * if that kind of event is configured to be relayed. */
+  void RelayEvent(Bridge *bridge, const char *kind, const Anope::string &text) {
+    if (!bridge || !this->relay_events.count(kind))
+      return;
+
+    BridgeProtocol *protocol = bridge->GetProtocol();
+    if (!protocol || !protocol->IsConnected())
+      return;
+
+    protocol->Notice(bridge, text);
+  }
+
+  void OnJoinChannel(User *u, Channel *c) override {
+    if (this->RelaysEventsFor(u))
+      this->RelayEvent(this->FindIrc(c->name), "join", u->nick + " joined");
+  }
+
+  void OnPartChannel(User *u, Channel *c, const Anope::string &channel,
+                     const Anope::string &msg) override {
+    if (this->RelaysEventsFor(u))
+      this->RelayEvent(this->FindIrc(channel), "part",
+                       u->nick + " left" + (msg.empty() ? "" : " (" + msg + ")"));
+  }
+
+  void OnUserNickChange(User *u, const Anope::string &oldnick) override {
+    if (!this->RelaysEventsFor(u))
+      return;
+
+    for (const auto &[c, _] : u->chans)
+      this->RelayEvent(this->FindIrc(c->name), "nick",
+                       oldnick + " is now known as " + u->nick);
+  }
+
+  void OnTopicUpdated(User *source, Channel *c, const Anope::string &user,
+                      const Anope::string &topic) override {
+    /* Only a topic set by a real user is an event; services restoring
+     * one on channel creation has no source. */
+    if (!this->RelaysEventsFor(source))
+      return;
+
+    this->RelayEvent(this->FindIrc(c->name), "topic",
+                     topic.empty() ? user + " cleared the topic"
+                                   : user + " changed the topic to: " + topic);
+  }
+
+  void OnUserKicked(const MessageSource &source, User *target,
+                    const Anope::string &channel, ChannelStatus &status,
+                    const Anope::string &kickmsg) override {
+    if (!this->RelaysEventsFor(target))
+      return;
+
+    this->RelayEvent(this->FindIrc(channel), "kick",
+                     source.GetSource() + " kicked " + target->nick +
+                         (kickmsg.empty() ? "" : " (" + kickmsg + ")"));
+  }
+
   void OnUserQuit(User *u, const Anope::string &msg) override {
     if (!u)
       return;
@@ -1362,8 +1448,16 @@ public:
 
       delete it->second;
       this->clients.erase(it);
-      break;
+      return;
     }
+
+    /* The user's channels are still known here; they go with the user. */
+    if (!this->RelaysEventsFor(u))
+      return;
+
+    for (const auto &[c, _] : u->chans)
+      this->RelayEvent(this->FindIrc(c->name), "quit",
+                       u->nick + " quit" + (msg.empty() ? "" : " (" + msg + ")"));
   }
 
   void OnPrivmsg(User *u, Channel *c, Anope::string &msg,

@@ -1311,6 +1311,34 @@ public:
            "**: " + dpp::utility::markdown_escape(plain) + " " + link + "\n";
   }
 
+  void Notice(Bridge *bridge, const Anope::string &text) override {
+    if (!this->cluster || !this->connected || text.empty())
+      return;
+
+    /* An event is about the channel rather than from anyone in it, so
+     * it comes from the bot account, not from a user's webhook, as one
+     * italic line. The whole text is literal and is escaped as such. */
+    std::string body = Text::TruncateCodePoints(
+        dpp::utility::markdown_escape(text.str(), true), 1998);
+    size_t slashes = 0;
+    while (slashes < body.length() && body[body.length() - 1 - slashes] == '\\')
+      ++slashes;
+    if (slashes % 2)
+      body.erase(body.length() - 1);
+    if (body.empty())
+      return;
+
+    dpp::message msg(dpp::snowflake(bridge->foreign_channel.c_str()),
+                     "*" + body + "*");
+    msg.set_allowed_mentions(false, false, false, false);
+    try {
+      this->cluster->message_create(msg);
+    } catch (const dpp::exception &err) {
+      Log(this->core->GetOwner()) << "BridgeServ: unable to relay an event to "
+                                  << bridge->irc_channel << ": " << err.what();
+    }
+  }
+
   void React(Bridge *bridge, const Anope::string &remote_id,
              const Anope::string &channel, const Anope::string &emoji,
              bool add) override {
