@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <ctime>
 #include <deque>
+#include <initializer_list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -333,6 +334,32 @@ namespace BridgeServ::Relay
 			}
 		}
 		return out;
+	}
+
+	/** The unescaped value of the first of `names` which `tags` carries
+	 * with a value, or an empty string when it carries none of them. An
+	 * empty value says as little as an absent tag to every caller here, so
+	 * a name which carries one is skipped over.
+	 *
+	 * Client tags get renamed when they leave draft: `+reply` is ratified
+	 * and is what this bridge sends, but a client written against the
+	 * draft sends `+draft/reply`, and both have to be read or that
+	 * client's reply is silently dropped. The order of `names` is the
+	 * precedence — pass the ratified name first.
+	 */
+	template <typename Map>
+	inline std::string TagValue(const Map &tags, std::initializer_list<const char *> names)
+	{
+		for (const auto *name : names)
+		{
+			const auto it = tags.find(name);
+			if (it == tags.end())
+				continue;
+			auto value = UnescapeTagValue(it->second.c_str());
+			if (!value.empty())
+				return value;
+		}
+		return {};
 	}
 
 	/** The IRC msgid the bridge stamps on a message it relayed from a

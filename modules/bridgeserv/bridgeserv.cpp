@@ -43,6 +43,17 @@ namespace Text = BridgeServ::Text;
  * one constant rather than a property of the protocol. */
 static constexpr const char *REMOTE_ID_PREFIX = "dc";
 
+/* The client tags the bridge speaks. The reply tag is ratified as `+reply`
+ * (IRCv3 registry), which is what is sent; `+draft/reply` is what clients
+ * written before the ratification send and is read as well, so a reply or a
+ * reaction from one of those is not silently dropped. React and unreact are
+ * still drafts and have no ratified name to prefer. */
+static constexpr const char *TAG_REPLY = "+reply";
+static constexpr const char *TAG_REPLY_DRAFT = "+draft/reply";
+static constexpr const char *TAG_REACT = "+draft/react";
+static constexpr const char *TAG_UNREACT = "+draft/unreact";
+static constexpr const char *TAG_TYPING = "+typing";
+
 class ModuleBridgeServ;
 
 /* The protocols which are available to bridge to. */
@@ -954,7 +965,7 @@ public:
     if (!msg.edit)
       first_tags["msgid"] = Relay::RemoteMsgId(REMOTE_ID_PREFIX, msg.msg_id.str());
     if (!msg.reply_to.empty())
-      first_tags["+draft/reply"] =
+      first_tags[TAG_REPLY] =
           Relay::EscapeTagValue(this->IrcIdFor(msg.reply_to).str());
 
     bool sent = false;
@@ -1037,9 +1048,9 @@ public:
      * inspircd.cpp's ircv3_ctctags handling), which is the only point at
      * which the answer is known, so nothing is checked here. */
     Anope::map<Anope::string> tags;
-    tags["+draft/reply"] =
+    tags[TAG_REPLY] =
         Relay::EscapeTagValue(this->IrcIdFor(reaction.remote_id).str());
-    tags[reaction.add ? "+draft/react" : "+draft/unreact"] =
+    tags[reaction.add ? TAG_REACT : TAG_UNREACT] =
         Relay::EscapeTagValue(reaction.emoji.str());
     IRCD->SendTagmsg(client->user, bridge->irc_channel, tags);
     ++bridge->stats.reactions_in;
@@ -1070,7 +1081,7 @@ public:
      * done event, clients time an active notification out on their own,
      * and the message which follows clears it. */
     IRCD->SendTagmsg(client->user, bridge->irc_channel,
-                     {{"+typing", "active"}});
+                     {{TAG_TYPING, "active"}});
     ++bridge->stats.typing_in;
   }
 
@@ -1551,8 +1562,7 @@ public:
     out.nick = u->nick;
     if (const auto it = tags.find("msgid"); it != tags.end())
       out.msgid = it->second;
-    if (const auto it = tags.find("+draft/reply"); it != tags.end())
-      out.reply_to = Relay::UnescapeTagValue(it->second.str());
+    out.reply_to = Relay::TagValue(tags, { TAG_REPLY, TAG_REPLY_DRAFT });
 
     Anope::string payload = msg;
     if (Anope::ParseCTCP(msg, ctcp_name, ctcp_body)) {
@@ -1598,7 +1608,7 @@ public:
     /* The remote indicator is for the bridge as a whole and lasts about
      * ten seconds, so one notification per eight is enough to keep it
      * up while anyone on IRC is typing. */
-    const auto typing = tags.find("+typing");
+    const auto typing = tags.find(TAG_TYPING);
     if (this->relay_typing && typing != tags.end() &&
         typing->second.equals_ci("active") &&
         Anope::CurTime - bridge->last_typing_out >= 8) {
@@ -1606,19 +1616,17 @@ public:
       protocol->Typing(bridge);
     }
 
-    /* A reaction names the message it is on with +draft/reply; one on a
+    /* A reaction names the message it is on with the reply tag; one on a
      * message which did not cross the bridge, or which is no longer
      * remembered, has nowhere to go. */
-    const auto react = tags.find("+draft/react");
-    const auto unreact = tags.find("+draft/unreact");
-    const auto reply = tags.find("+draft/reply");
-    const bool add = react != tags.end();
-    if (this->relay_reactions && reply != tags.end() &&
-        (add || unreact != tags.end())) {
-      const Anope::string emoji =
-          Relay::UnescapeTagValue((add ? react : unreact)->second.str());
-      const Anope::string remote_id =
-          this->RemoteIdFor(Relay::UnescapeTagValue(reply->second.str()));
+    const Anope::string react = Relay::TagValue(tags, { TAG_REACT });
+    const Anope::string unreact = Relay::TagValue(tags, { TAG_UNREACT });
+    const Anope::string reply =
+        Relay::TagValue(tags, { TAG_REPLY, TAG_REPLY_DRAFT });
+    const bool add = !react.empty();
+    if (this->relay_reactions && !reply.empty() && (add || !unreact.empty())) {
+      const Anope::string emoji = add ? react : unreact;
+      const Anope::string remote_id = this->RemoteIdFor(reply);
       if (!emoji.empty() && !remote_id.empty()) {
         /* Reactions draw from the bridge's bucket like lines do. */
         if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,

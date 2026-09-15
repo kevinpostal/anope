@@ -3,6 +3,9 @@
 #include "check.h"
 #include "modules/bridgeserv/relay.h"
 
+#include <map>
+#include <string>
+
 using namespace BridgeServ::Relay;
 
 static void TestTake()
@@ -164,6 +167,24 @@ static void TestTagValues()
 	CHECK_EQ(UnescapeTagValue("plain"), std::string("plain"));
 }
 
+static void TestTagLookup()
+{
+	// A client written before the reply tag was ratified sends the draft
+	// name; its reply still has to be read.
+	std::map<std::string, std::string> tags = { { "+draft/reply", "a\\sb" } };
+	CHECK_EQ(TagValue(tags, { "+reply", "+draft/reply" }), std::string("a b"));
+	CHECK_EQ(TagValue(tags, { "+draft/react" }), std::string(""));
+
+	// The ratified name wins when a client sends both.
+	tags["+reply"] = "ratified";
+	CHECK_EQ(TagValue(tags, { "+reply", "+draft/reply" }), std::string("ratified"));
+
+	// An empty value says as little as no tag at all, so the next name
+	// still gets its turn.
+	tags["+reply"] = "";
+	CHECK_EQ(TagValue(tags, { "+reply", "+draft/reply" }), std::string("a b"));
+}
+
 static void TestRemoteMsgId()
 {
 	CHECK_EQ(RemoteMsgId("dc", "123"), std::string("dc-123"));
@@ -216,6 +237,7 @@ static void RunTests()
 	TestSanitiseNick();
 	TestHistory();
 	TestTagValues();
+	TestTagLookup();
 	TestRemoteMsgId();
 	TestLinks();
 }
