@@ -394,8 +394,17 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   /* Pseudo clients                                                     */
   /* ------------------------------------------------------------------ */
 
-  Anope::string MakeNick(const Anope::string &raw,
-                         const Anope::string &suffix,
+  /** Derives the IRC nickname of a pseudo client.
+   *
+   * @param raw The remote display name.
+   * @param suffix The bridge's configured nickname suffix.
+   * @param network The name of the bridged network, used to disambiguate
+   *                a nickname which is already taken.
+   * @param ignore A client which may hold the nickname without counting
+   *               as a collision (the one being renamed).
+   */
+  Anope::string MakeNick(const Anope::string &raw, const Anope::string &suffix,
+                         const Anope::string &network,
                          const User *ignore = nullptr) const {
     /* Leave room for the suffix and for the uniquifying counter. */
     const size_t maxlen = IRCD->MaxNick ? IRCD->MaxNick : 31;
@@ -411,16 +420,34 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
       return "";
 
     const Anope::string candidate = nick;
-    for (unsigned counter = 2;; ++counter) {
+
+    /* A taken nickname is usually the same person's own IRC client, so
+     * the first alternative names the network they are bridged from —
+     * "Zodiac_discord" rather than "Zodiac_2", which says nothing. The
+     * counter is only reached when that is taken too. It is built from
+     * the untruncated candidate where the length allows, so the readable
+     * part is not shortened for everyone who does not collide. */
+    Anope::string tagged;
+    if (!network.empty() && maxlen > network.length() + 1) {
+      const size_t room = maxlen - network.length() - 1;
+      tagged = (candidate.length() > room ? candidate.substr(0, room)
+                                          : candidate) + "_" + network;
+    }
+
+    for (unsigned counter = 0; counter <= 99; ++counter) {
+      if (counter == 1) {
+        if (tagged.empty() || tagged.equals_ci(candidate))
+          continue;
+        nick = tagged;
+      } else if (counter > 1) {
+        nick = candidate + "_" + Anope::ToString(counter);
+      }
+
       const User *held = User::Find(nick, true);
       if ((!held || held == ignore) && IRCD->IsNickValid(nick))
-        break;
-      if (counter > 99)
-        return "";
-
-      nick = candidate + "_" + Anope::ToString(counter);
+        return nick;
     }
-    return nick;
+    return "";
   }
 
   Anope::string MakeIdent(const Anope::string &user_id) {
@@ -470,8 +497,8 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
                            Servers::GetUplink() &&
                                Servers::GetUplink()->IsSynced());
       } else {
-        const Anope::string renamed =
-            this->MakeNick(display, bridge->nick_suffix, client->user);
+        const Anope::string renamed = this->MakeNick(
+            display, bridge->nick_suffix, protocol->GetName(), client->user);
         if (renamed.empty()) {
           Log(this) << "BridgeServ: unable to allocate an IRC nick for the "
                     << "new display name of " << client->user->nick
@@ -503,7 +530,8 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
     if (!link)
       return nullptr;
 
-    const Anope::string nick = this->MakeNick(display, bridge->nick_suffix);
+    const Anope::string nick =
+        this->MakeNick(display, bridge->nick_suffix, protocol->GetName());
     if (nick.empty()) {
       Log(this) << "BridgeServ: unable to allocate an IRC nick for "
                 << protocol->GetName() << " user " << user_id
