@@ -138,11 +138,73 @@ namespace BridgeServ::Relay
 		return out;
 	}
 
+	/** Folds a code point onto the ASCII character it imitates.
+	 *
+	 * Display names are often written entirely in one of the look-alike
+	 * alphabets: the fullwidth forms, or the mathematical alphanumerics
+	 * that clients offer as "fancy" fonts. To a reader those are ASCII, so
+	 * they are folded back rather than discarded — otherwise a name made
+	 * only of them keeps nothing and collapses to "bridge", which is no
+	 * use in a channel whose point is showing who is there.
+	 *
+	 * This is deliberately not a general transliteration: an accented
+	 * Latin letter is a letter in its own right, not a disguised ASCII
+	 * one, and still becomes an underscore.
+	 *
+	 * @return The ASCII character, or 0 if the code point imitates none.
+	 */
+	inline char FoldToAscii(unsigned long codepoint)
+	{
+		/* Halfwidth and Fullwidth Forms: a shifted copy of printable ASCII. */
+		if (codepoint >= 0xFF01 && codepoint <= 0xFF5E)
+			return static_cast<char>(codepoint - 0xFEE0);
+
+		/* Mathematical Alphanumeric Symbols: consecutive styles of 52
+		 * letters, A-Z then a-z. The slots of the letters which Unicode had
+		 * already encoded in Letterlike Symbols are left reserved, so the
+		 * arithmetic holds for every assigned code point in the range. */
+		if (codepoint >= 0x1D400 && codepoint <= 0x1D6A3)
+		{
+			const unsigned long index = (codepoint - 0x1D400) % 52;
+			return static_cast<char>(index < 26 ? 'A' + index : 'a' + (index - 26));
+		}
+
+		/* The same block's digits: five styles of 0-9. */
+		if (codepoint >= 0x1D7CE && codepoint <= 0x1D7FF)
+			return static_cast<char>('0' + (codepoint - 0x1D7CE) % 10);
+
+		/* The reserved slots above: letters which live in Letterlike
+		 * Symbols instead, and so are what a styled name actually uses. */
+		switch (codepoint)
+		{
+			case 0x2102: case 0x212D:                       return 'C';
+			case 0x210A:                                    return 'g';
+			case 0x210B: case 0x210C: case 0x210D:          return 'H';
+			case 0x210E:                                    return 'h';
+			case 0x2110: case 0x2111:                       return 'I';
+			case 0x2112:                                    return 'L';
+			case 0x2113:                                    return 'l';
+			case 0x2115:                                    return 'N';
+			case 0x2119:                                    return 'P';
+			case 0x211A:                                    return 'Q';
+			case 0x211B: case 0x211C: case 0x211D:          return 'R';
+			case 0x2124: case 0x2128:                       return 'Z';
+			case 0x212C:                                    return 'B';
+			case 0x212F:                                    return 'e';
+			case 0x2130:                                    return 'E';
+			case 0x2131:                                    return 'F';
+			case 0x2133:                                    return 'M';
+			case 0x2134:                                    return 'o';
+			default:                                        return 0;
+		}
+	}
+
 	/** Derives the base of an IRC nickname from a display name.
 	 *
-	 * ASCII letters and digits are kept; every other run of characters
-	 * becomes a single underscore, trailing underscores are trimmed, and a
-	 * name with nothing usable in it becomes "bridge".
+	 * ASCII letters and digits are kept, as are the look-alike alphabets
+	 * FoldToAscii() understands; every other run of characters becomes a
+	 * single underscore, trailing underscores are trimmed, and a name with
+	 * nothing usable in it becomes "bridge".
 	 *
 	 * @param raw The display name.
 	 * @param budget The maximum length of the result.
@@ -151,14 +213,61 @@ namespace BridgeServ::Relay
 	inline std::string SanitiseNick(const std::string &raw, size_t budget)
 	{
 		std::string base;
-		for (const auto raw_chr : raw)
+		for (size_t pos = 0; pos < raw.length(); )
 		{
 			if (base.length() >= budget)
 				break;
 
-			const auto chr = static_cast<unsigned char>(raw_chr);
-			if (chr < 0x80 && std::isalnum(chr))
-				base.push_back(static_cast<char>(chr));
+			/* Decoded by hand: the sanitiser is deliberately free of any
+			 * dependency, and only the code point value is wanted. A
+			 * malformed sequence is consumed one byte at a time and lands
+			 * on the underscore path below. */
+			const auto lead = static_cast<unsigned char>(raw[pos]);
+			unsigned long codepoint = lead;
+			size_t length = 1;
+			if (lead >= 0xF0)
+				length = 4, codepoint = lead & 0x07;
+			else if (lead >= 0xE0)
+				length = 3, codepoint = lead & 0x0F;
+			else if (lead >= 0xC0)
+				length = 2, codepoint = lead & 0x1F;
+
+			if (length > 1)
+			{
+				if (pos + length > raw.length())
+					length = 1, codepoint = lead;
+				else
+				{
+					for (size_t i = 1; i < length; ++i)
+					{
+						const auto cont = static_cast<unsigned char>(raw[pos + i]);
+						if ((cont & 0xC0) != 0x80)
+						{
+							length = 1;
+							codepoint = lead;
+							break;
+						}
+						codepoint = (codepoint << 6) | (cont & 0x3F);
+					}
+				}
+			}
+			pos += length;
+
+			char kept = 0;
+			if (codepoint < 0x80)
+			{
+				if (std::isalnum(static_cast<unsigned char>(codepoint)))
+					kept = static_cast<char>(codepoint);
+			}
+			else
+			{
+				const char folded = FoldToAscii(codepoint);
+				if (folded && std::isalnum(static_cast<unsigned char>(folded)))
+					kept = folded;
+			}
+
+			if (kept)
+				base.push_back(kept);
 			else if (!base.empty() && base.back() != '_')
 				base.push_back('_');
 		}

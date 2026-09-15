@@ -94,6 +94,27 @@ static void TestSanitiseNick()
 	CHECK_EQ(SanitiseNick("abcdef", 3), std::string("abc"));
 	CHECK_EQ(SanitiseNick("abc!!!", 30), std::string("abc"));
 	CHECK_EQ(SanitiseNick("a b", 2), std::string("a"));
+
+	// A name written entirely in a look-alike alphabet is still a name: a
+	// roster which showed these as "bridge" would be useless. Mathematical
+	// sans-serif bold "ACIDVEGAS" and fullwidth "dollx".
+	CHECK_EQ(SanitiseNick("\xf0\x9d\x97\x94\xf0\x9d\x97\x96\xf0\x9d\x97\x9c\xf0\x9d\x97\x97"
+			      "\xf0\x9d\x97\xa9\xf0\x9d\x97\x98\xf0\x9d\x97\x9a\xf0\x9d\x97\x94"
+			      "\xf0\x9d\x97\xa6", 30), std::string("ACIDVEGAS"));
+	CHECK_EQ(SanitiseNick("\xef\xbd\x84\xef\xbd\x8f\xef\xbd\x8c\xef\xbd\x8c\xef\xbd\x98", 30),
+		 std::string("dollx"));
+
+	// Mathematical digits fold too, and the letters Unicode moved out of
+	// the block into Letterlike Symbols still resolve: script "L".
+	CHECK_EQ(SanitiseNick("\xf0\x9d\x9f\x8f", 30), std::string("1"));
+	CHECK_EQ(SanitiseNick("\xe2\x84\x92", 30), std::string("L"));
+
+	// Decorated names keep the readable part rather than the decoration.
+	CHECK_EQ(SanitiseNick("\xe2\x96\x88\xe2\x96\x93" "Deviance" "\xe2\x96\x93\xe2\x96\x88", 30),
+		 std::string("Deviance"));
+
+	// A truncated multi-byte sequence must not run off the end.
+	CHECK_EQ(SanitiseNick("ab\xf0\x9d\x97", 30), std::string("ab"));
 }
 
 static void TestHistory()

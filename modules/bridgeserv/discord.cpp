@@ -83,6 +83,11 @@ class DiscordFilter final {
   /* Discord channel ids which are bridged. */
   std::unordered_set<std::string> bridged_channels;
 
+  /* Discord guild ids which have at least one bridged channel, so that
+   * the Discord thread can ignore roster and presence traffic from the
+   * other guilds the bot account happens to be in. */
+  std::unordered_set<std::string> bridged_spaces;
+
   /* Webhook ids which this module created or adopted, so that the Discord
    * thread can discard the messages that it sent itself. */
   std::unordered_set<std::string> own_webhook_ids;
@@ -91,10 +96,23 @@ class DiscordFilter final {
    * discard the bot-account fallback messages that it sent itself. */
   std::string own_user_id;
 
+  /* The presence Discord last reported per user id. */
+  std::unordered_map<std::string, dpp::presence_status> presences;
+
 public:
   bool IsBridged(const std::string &channel_id) {
     std::lock_guard<std::mutex> lock(this->mutex);
     return this->bridged_channels.count(channel_id) > 0;
+  }
+
+  bool IsBridgedSpace(const std::string &guild_id) {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    return this->bridged_spaces.count(guild_id) > 0;
+  }
+
+  void SetBridgedSpaces(std::unordered_set<std::string> guild_ids) {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    this->bridged_spaces = std::move(guild_ids);
   }
 
   void SetBridged(std::unordered_set<std::string> channel_ids) {
@@ -141,6 +159,32 @@ public:
     std::lock_guard<std::mutex> lock(this->mutex);
     this->own_user_id = user_id;
   }
+
+  /** Records the presence Discord last reported for a user. */
+  void SetPresence(const std::string &user_id, dpp::presence_status status) {
+    if (user_id.empty() || user_id == "0")
+      return;
+
+    std::lock_guard<std::mutex> lock(this->mutex);
+    this->presences[user_id] = status;
+  }
+
+  /** The last presence reported for a user, if any was.
+   *
+   * Discord only sends presences with a guild create and then as updates,
+   * and DPP caches neither, so they are kept here: a roster which is
+   * rebuilt later would otherwise show everybody as present.
+   */
+  bool GetPresence(const std::string &user_id,
+                   dpp::presence_status &status) {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    const auto it = this->presences.find(user_id);
+    if (it == this->presences.end())
+      return false;
+
+    status = it->second;
+    return true;
+  }
 };
 
 /** A thread running the shared DPP socket engine. */
@@ -166,6 +210,11 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
   Anope::string webhook_name;
   Anope::string webhook_suffix;
 
+  /* Whether the privileged GUILD_PRESENCES intent is requested, which
+   * decides whether a bridged member can be shown away on IRC. Requesting
+   * an intent which the application is not approved for makes Discord
+   * close the gateway with 4014, so this is opt-in rather than inferred. */
+  bool use_presence = false;
   bool connected = false;
 
   /* ------------------------------------------------------------------ */
@@ -355,6 +404,103 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
   }
 
   /* ------------------------------------------------------------------ */
+  /* Roster and presence (Discord thread)                               */
+  /* ------------------------------------------------------------------ */
+
+  /** The name a guild member should appear under on IRC.
+   *
+   * The per-guild nickname wins, then the account display name, then the
+   * login name — the same order a Discord client shows them in.
+   */
+  static std::string MemberDisplay(const dpp::guild_member &member) {
+    std::string display = member.get_nickname();
+    if (display.empty()) {
+      /* The user object is cached by the same gateway events which carry
+       * the membership, so this is a cache read and not a REST call. */
+      if (const auto *user = member.get_user()) {
+        display = user->global_name;
+        if (display.empty())
+          display = user->username;
+      }
+    }
+    if (display.empty())
+      display = "discord";
+    return display;
+  }
+
+  /** Anything but "online" is away on IRC: idle, do-not-disturb and
+   * offline all mean the person is not there to read the channel.
+   */
+  static bool PresenceAway(dpp::presence_status status) {
+    return status != dpp::ps_online;
+  }
+
+  static Anope::string PresenceReason(dpp::presence_status status) {
+    switch (status) {
+    case dpp::ps_idle:
+      return "Idle on Discord";
+    case dpp::ps_dnd:
+      return "Do not disturb on Discord";
+    case dpp::ps_offline:
+      return "Offline on Discord";
+    default:
+      return "Away on Discord";
+    }
+  }
+
+  /** Hands a set of guild members to the service as a roster.
+   * @param presences Presences which came with this event, empty for the
+   *                  events which carry none. Any presence already known
+   *                  for a member is applied whether or not it is here.
+   */
+  static void HandleRoster(const std::shared_ptr<DiscordFilter> &filter,
+                           const std::shared_ptr<Mailbox> &mailbox,
+                           dpp::snowflake guild_id,
+                           const dpp::guild_member_map &members,
+                           const dpp::presence_map &presences) {
+    const std::string space = guild_id.str();
+    if (space.empty() || !filter->IsBridgedSpace(space))
+      return;
+
+    std::vector<BridgeMember> roster;
+    roster.reserve(members.size());
+    for (const auto &[user_id, member] : members) {
+      /* The bridge's own account must not be given a pseudo client: it
+       * stands for IRC on Discord, not the other way round. */
+      const std::string id = user_id.str();
+      if (id.empty() || filter->IsSelf(id))
+        continue;
+
+      BridgeMember entry;
+      entry.user_id = id;
+      entry.display = MemberDisplay(member);
+
+      /* Presences arrive once, with the guild create; the member list
+       * arrives in chunks afterwards, so the two are joined through the
+       * filter's cache rather than only within one event. */
+      const auto presence = presences.find(user_id);
+      if (presence != presences.end())
+        filter->SetPresence(id, presence->second.status());
+
+      dpp::presence_status status = dpp::ps_online;
+      if (filter->GetPresence(id, status)) {
+        entry.presence_known = true;
+        entry.away = PresenceAway(status);
+        entry.away_reason = PresenceReason(status);
+      }
+      roster.push_back(std::move(entry));
+    }
+
+    if (roster.empty())
+      return;
+
+    const Anope::string key = space;
+    mailbox->Post([key, roster](DiscordProtocol *protocol) {
+      protocol->core->SyncRoster(protocol->GetName(), key, roster);
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Connection lifecycle                                               */
   /* ------------------------------------------------------------------ */
 
@@ -376,8 +522,17 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
         bridge->endpoint_pending = false;
     }
 
-    static constexpr uint32_t intents =
-        dpp::i_guilds | dpp::i_guild_messages | dpp::i_message_content;
+    /* GUILD_MEMBERS is what makes the roster visible at all: without it
+     * Discord sends no member list and the IRC channel can only ever show
+     * the people who have spoken. GUILD_PRESENCES is only added when the
+     * operator has enabled it, because an intent the application is not
+     * approved for is answered with gateway close 4014. */
+    uint32_t intents =
+        dpp::i_guilds | dpp::i_guild_messages | dpp::i_message_content |
+        dpp::i_guild_members;
+    if (this->use_presence)
+      intents |= dpp::i_guild_presences;
+
     this->cluster = new dpp::cluster(this->token.str(), intents);
 
     auto mailbox = this->mailbox;
@@ -390,6 +545,20 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
       const std::string message = event.message;
       mailbox->Post([message](DiscordProtocol *protocol) {
         Log(protocol->core->GetOwner()) << "DPP: " << message;
+
+        /* 4014 is Discord refusing a privileged intent. It is fatal to
+         * the gateway, so say which switch fixes it rather than leaving
+         * a bare DPP error in the log. */
+        if (message.find("4014") == std::string::npos)
+          return;
+
+        Log(protocol->core->GetOwner())
+            << "BridgeServ: Discord refused a privileged gateway intent. "
+            << "Enable SERVER MEMBERS INTENT"
+            << (protocol->use_presence ? " and PRESENCE INTENT" : "")
+            << " for this application at "
+            << "https://discord.com/developers, or set <bridgeserv:"
+            << "usepresence> to no; the bridge cannot connect until then.";
       });
     });
 
@@ -431,6 +600,71 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
         protocol->core->RelayToIrc(relay);
       });
     });
+
+    /* A guild create carries the members Discord sends up front; DPP then
+     * asks for the rest of the roster, which arrives as member chunks. */
+    this->cluster->on_guild_create(
+        [mailbox, filter](const dpp::guild_create_t &event) {
+          HandleRoster(filter, mailbox, event.created.id, event.created.members,
+                       event.presences);
+        });
+
+    this->cluster->on_guild_members_chunk(
+        [mailbox, filter](const dpp::guild_members_chunk_t &event) {
+          HandleRoster(filter, mailbox, event.adding.id, event.members, {});
+        });
+
+    this->cluster->on_guild_member_add(
+        [mailbox, filter](const dpp::guild_member_add_t &event) {
+          dpp::guild_member_map one;
+          one[event.added.user_id] = event.added;
+          HandleRoster(filter, mailbox, event.adding_guild.id, one, {});
+        });
+
+    /* A nickname change arrives here; the roster path renames the pseudo
+     * client in place rather than reintroducing it. */
+    this->cluster->on_guild_member_update(
+        [mailbox, filter](const dpp::guild_member_update_t &event) {
+          dpp::guild_member_map one;
+          one[event.updated.user_id] = event.updated;
+          HandleRoster(filter, mailbox, event.updating_guild.id, one, {});
+        });
+
+    this->cluster->on_guild_member_remove(
+        [mailbox, filter](const dpp::guild_member_remove_t &event) {
+          const std::string space = event.guild_id.str();
+          const std::string user_id = event.removed.id.str();
+          if (space.empty() || user_id.empty() ||
+              !filter->IsBridgedSpace(space))
+            return;
+
+          const Anope::string key = space;
+          const Anope::string who = user_id;
+          mailbox->Post([key, who](DiscordProtocol *protocol) {
+            protocol->core->RemoveMember(protocol->GetName(), key, who);
+          });
+        });
+
+    this->cluster->on_presence_update(
+        [mailbox, filter](const dpp::presence_update_t &event) {
+          const std::string space = event.rich_presence.guild_id.str();
+          const std::string user_id = event.rich_presence.user_id.str();
+          if (space.empty() || user_id.empty() ||
+              !filter->IsBridgedSpace(space) || filter->IsSelf(user_id))
+            return;
+
+          const auto status = event.rich_presence.status();
+          filter->SetPresence(user_id, status);
+
+          const Anope::string key = space;
+          const Anope::string who = user_id;
+          const bool away = PresenceAway(status);
+          const Anope::string reason = PresenceReason(status);
+          mailbox->Post([key, who, away, reason](DiscordProtocol *protocol) {
+            protocol->core->SetPresence(protocol->GetName(), key, who, away,
+                                        reason);
+          });
+        });
 
     this->thread = new DiscordThread(this->cluster, this->mailbox);
     this->thread->Start();
@@ -734,10 +968,16 @@ public:
     this->webhook_suffix = StripControl(
         block.Get<const Anope::string>("webhooksuffix", " (IRC)").str());
 
+    /* The intent set is fixed when the gateway session is opened, so a
+     * change of usepresence needs a fresh connection to take effect. */
+    const bool want_presence = block.Get<bool>("usepresence", "no");
+    const bool presence_changed = want_presence != this->use_presence;
+
     const Anope::string new_token = block.Get<const Anope::string>("token");
-    if (new_token != this->token || !this->cluster) {
+    if (new_token != this->token || presence_changed || !this->cluster) {
       this->StopCluster();
       this->token = new_token;
+      this->use_presence = want_presence;
       this->StartCluster();
     }
 
@@ -758,17 +998,21 @@ public:
 
   void OnBridgesChanged() override {
     std::unordered_set<std::string> channels;
+    std::unordered_set<std::string> spaces;
     std::unordered_set<std::string> webhooks;
     for (const auto *bridge : this->core->GetBridges()) {
       if (!bridge->protocol.equals_ci(this->GetName()))
         continue;
 
       channels.insert(bridge->foreign_channel.str());
+      if (!bridge->space.empty())
+        spaces.insert(bridge->space.str());
       if (!bridge->endpoint_id.empty())
         webhooks.insert(bridge->endpoint_id.str());
     }
 
     this->filter->SetBridged(std::move(channels));
+    this->filter->SetBridgedSpaces(std::move(spaces));
     this->filter->SetOwnWebhooks(std::move(webhooks));
 
     if (!this->connected)
@@ -777,6 +1021,54 @@ public:
     for (auto *bridge : this->core->GetBridges()) {
       if (bridge->protocol.equals_ci(this->GetName()))
         this->EnsureWebhook(bridge);
+    }
+
+    /* A bridge which was just pointed at a guild has no membership on
+     * IRC yet, and no further guild create is coming for a guild which
+     * was already connected. */
+    this->RefreshRoster();
+  }
+
+  void RefreshRoster() override {
+    if (!this->cluster || !this->connected)
+      return;
+
+    std::unordered_set<std::string> spaces;
+    for (const auto *bridge : this->core->GetBridges()) {
+      if (bridge->protocol.equals_ci(this->GetName()) &&
+          !bridge->space.empty())
+        spaces.insert(bridge->space.str());
+    }
+
+    for (const auto &space : spaces) {
+      /* DPP keeps the membership of every guild it has seen, so the
+       * roster is rebuilt from the cache without asking Discord again. */
+      const dpp::guild *guild = dpp::find_guild(dpp::snowflake(space));
+      if (!guild)
+        continue;
+
+      std::vector<BridgeMember> roster;
+      roster.reserve(guild->members.size());
+      for (const auto &[user_id, member] : guild->members) {
+        const std::string id = user_id.str();
+        if (id.empty() || this->filter->IsSelf(id))
+          continue;
+
+        BridgeMember entry;
+        entry.user_id = id;
+        entry.display = MemberDisplay(member);
+
+        dpp::presence_status status = dpp::ps_online;
+        if (this->filter->GetPresence(id, status)) {
+          entry.presence_known = true;
+          entry.away = PresenceAway(status);
+          entry.away_reason = PresenceReason(status);
+        }
+        roster.push_back(std::move(entry));
+      }
+
+      if (!roster.empty())
+        this->core->SyncRoster(this->GetName(), space, roster);
     }
   }
 

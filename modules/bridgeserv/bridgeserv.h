@@ -57,6 +57,26 @@ struct BridgeOutbound final {
   bool action = false;
 };
 
+/** One member of a bridged space, as the roster sees them.
+ *
+ * A bridge introduces an IRC pseudo client for every member of the space it
+ * is pointed at, so that the IRC channel shows the same population as the
+ * remote one instead of only the people who have happened to speak.
+ */
+struct BridgeMember final {
+  /* The remote user, and the name they should appear under. */
+  Anope::string user_id;
+  Anope::string display;
+  /* Whether the remote network reports them as away, and the reason to
+   * put on the IRC AWAY. Only meaningful when presence is known. */
+  bool away = false;
+  Anope::string away_reason;
+  /* Whether the protocol actually knows their presence. A protocol which
+   * cannot see presence leaves this false and the client is never marked
+   * away rather than being marked permanently present. */
+  bool presence_known = false;
+};
+
 /** The part of the service which a protocol is allowed to use.
  *
  * A protocol never touches users, channels, or servers: it hands messages to
@@ -81,6 +101,27 @@ public:
 
   /** Relays a message from a bridged network into its IRC channel. */
   virtual void RelayToIrc(const BridgeMessage &msg) = 0;
+
+  /** Introduces (or updates) the members of a bridged space and joins them
+   * to every IRC channel bridged to it.
+   *
+   * Safe to call repeatedly and with partial rosters: a member who already
+   * has a client keeps it, so a re-sync does not churn the IRC channel.
+   */
+  virtual void SyncRoster(const Anope::string &protocol,
+                          const Anope::string &space,
+                          const std::vector<BridgeMember> &members) = 0;
+
+  /** Retires the client of a member who is no longer in the space. */
+  virtual void RemoveMember(const Anope::string &protocol,
+                            const Anope::string &space,
+                            const Anope::string &user_id) = 0;
+
+  /** Marks the client of a member away or back, from remote presence. */
+  virtual void SetPresence(const Anope::string &protocol,
+                           const Anope::string &space,
+                           const Anope::string &user_id, bool away,
+                           const Anope::string &reason) = 0;
 
   /** Delivers the result of an asynchronous listing to its requester.
    * @param requester The UID (or, on IRCds without UIDs, the nickname) of
@@ -140,6 +181,16 @@ public:
 
   /** Called when the set of bridges has changed in any way. */
   virtual void OnBridgesChanged() {}
+
+  /** Re-sends the roster of every bridged space from whatever the
+   * protocol has cached.
+   *
+   * The remote network and the IRC uplink come up independently, so the
+   * roster which arrives with a remote connection can land before IRC is
+   * ready for it. This is called once IRC is, and whenever the set of
+   * bridges changes, so the population converges either way round.
+   */
+  virtual void RefreshRoster() {}
 
   /** Called when a bridge is about to stop using its remote channel, so
    * that any delivery endpoint set up for it can be torn down.
