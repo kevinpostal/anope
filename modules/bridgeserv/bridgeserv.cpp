@@ -471,6 +471,16 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
           Log(this) << "BridgeServ: renamed pseudo client " << previous
                     << " to " << renamed;
         }
+
+        /* The realname carries the display name too, and a case-only
+         * change reaches here without a nick change. Anope has no
+         * outbound realname API; FNAME is what its own inbound handler
+         * relays, and the IRCd shows it to clients as SETNAME. */
+        const Anope::string realname = Anope::Format(
+            "%s (%s)", display.c_str(), protocol->GetName().c_str());
+        client->user->SetRealname(realname);
+        Uplink::Send(client->user, "FNAME", realname);
+
         client->display = display;
         return client;
       }
