@@ -42,6 +42,12 @@ struct BridgeMessage final {
   Anope::string msg_id;
   /* The message, rendered as IRC-ready text. */
   Anope::string text;
+  /* The remote id of the message this one replies to, if any. */
+  Anope::string reply_to;
+  /* The remote thread it was posted in, and that thread's display name,
+   * when it was not posted in the bridged channel itself. */
+  Anope::string thread;
+  Anope::string thread_name;
 
   bool edit = false;
   bool del = false;
@@ -55,6 +61,10 @@ struct BridgeOutbound final {
   Anope::string text;
   /* Whether the message was a CTCP ACTION. */
   bool action = false;
+  /* The IRC msgid of the line, and the msgid of the line it replies to
+   * (already unescaped), when the IRCd supplied them. */
+  Anope::string msgid;
+  Anope::string reply_to;
 };
 
 /** One member of a bridged space, as the roster sees them.
@@ -101,6 +111,27 @@ public:
 
   /** Relays a message from a bridged network into its IRC channel. */
   virtual void RelayToIrc(const BridgeMessage &msg) = 0;
+
+  /** Records that an IRC message was delivered to the remote network, so
+   * that later replies and reactions can be mapped in both directions. */
+  virtual void RememberLink(const BridgeServ::Relay::Links::Entry &entry) = 0;
+
+  /** The IRC msgid to use when IRC needs to refer to a remote message. */
+  virtual Anope::string IrcIdFor(const Anope::string &remote_id) const = 0;
+
+  /** The remote id an IRC msgid refers to, or "" when it is not known. */
+  virtual Anope::string RemoteIdFor(const Anope::string &irc_msgid) const = 0;
+
+  /** Looks up what is known about a remote message for quoting it.
+   * @param remote_id The remote message id.
+   * @param author The display name of who sent it.
+   * @param excerpt The start of its text.
+   * @param thread The remote thread it lives in, or "" for the channel.
+   * @return Whether the message is still remembered.
+   */
+  virtual bool QuotedMessage(const Anope::string &remote_id,
+                             Anope::string &author, Anope::string &excerpt,
+                             Anope::string &thread) const = 0;
 
   /** Introduces (or updates) the members of a bridged space and joins them
    * to every IRC channel bridged to it.

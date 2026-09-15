@@ -122,16 +122,16 @@ static void TestHistory()
 	History history(2);
 	CHECK_EQ(history.Size(), size_t(0));
 
-	history.Remember("A", { 1, "a" });
-	history.Remember("B", { 2, "b" });
-	history.Remember("C", { 3, "c" });
+	history.Remember("A", { 1, "a", "", "" });
+	history.Remember("B", { 2, "b", "", "" });
+	history.Remember("C", { 3, "c", "", "" });
 	CHECK(history.Find("A") == nullptr);
 	CHECK(history.Find("B") != nullptr);
 	CHECK(history.Find("C") != nullptr);
 	CHECK_EQ(history.Size(), size_t(2));
 
 	// Updating an entry does not consume capacity.
-	history.Remember("B", { 22, "bb" });
+	history.Remember("B", { 22, "bb", "", "" });
 	CHECK_EQ(history.Size(), size_t(2));
 	CHECK(history.Find("C") != nullptr);
 	CHECK_EQ(history.Find("B")->hash, size_t(22));
@@ -143,11 +143,69 @@ static void TestHistory()
 	CHECK_EQ(history.Size(), size_t(1));
 
 	// A forgotten key does not count against later eviction.
-	history.Remember("D", { 4, "d" });
-	history.Remember("B", { 5, "b" });
+	history.Remember("D", { 4, "d", "", "" });
+	history.Remember("B", { 5, "b", "", "" });
 	CHECK(history.Find("C") == nullptr);
 	CHECK(history.Find("D") != nullptr);
 	CHECK(history.Find("B") != nullptr);
+}
+
+static void TestTagValues()
+{
+	const std::string raw = "a;b c\\d\r\n";
+	const std::string escaped = "a\\:b\\sc\\\\d\\r\\n";
+	CHECK_EQ(EscapeTagValue(raw), escaped);
+	CHECK_EQ(UnescapeTagValue(escaped), raw);
+	CHECK_EQ(EscapeTagValue(""), std::string(""));
+
+	// A parser is lenient where an encoder is strict: an unknown escape
+	// yields the character and a trailing backslash is dropped.
+	CHECK_EQ(UnescapeTagValue("\\x\\"), std::string("x"));
+	CHECK_EQ(UnescapeTagValue("plain"), std::string("plain"));
+}
+
+static void TestRemoteMsgId()
+{
+	CHECK_EQ(RemoteMsgId("dc", "123"), std::string("dc-123"));
+
+	std::string out;
+	CHECK(ParseRemoteMsgId("dc-123", "dc", out));
+	CHECK_EQ(out, std::string("123"));
+	CHECK(!ParseRemoteMsgId("x~1~2", "dc", out));
+	CHECK(!ParseRemoteMsgId("dc-", "dc", out));
+	CHECK(!ParseRemoteMsgId("dcx-1", "dc", out));
+	CHECK(!ParseRemoteMsgId("", "dc", out));
+}
+
+static void TestLinks()
+{
+	Links links(2);
+	CHECK_EQ(links.Size(), size_t(0));
+
+	links.Remember({ "i1", "r1", "chan", "", "alice", "one" });
+	links.Remember({ "i2", "r2", "chan", "thread", "bob", "two" });
+	links.Remember({ "i3", "r3", "chan", "", "carol", "three" });
+
+	// The oldest link is evicted from both directions at once.
+	CHECK(links.ByIrc("i1") == nullptr);
+	CHECK(links.ByRemote("r1") == nullptr);
+	CHECK_EQ(links.Size(), size_t(2));
+
+	// Both lookups find the same entry.
+	const auto *by_irc = links.ByIrc("i2");
+	const auto *by_remote = links.ByRemote("r2");
+	CHECK(by_irc != nullptr);
+	CHECK(by_irc == by_remote);
+	CHECK_EQ(by_irc->remote_thread, std::string("thread"));
+	CHECK_EQ(by_irc->author, std::string("bob"));
+
+	// Re-linking an IRC message replaces its remote side without
+	// consuming capacity.
+	links.Remember({ "i3", "r33", "chan", "", "carol", "three again" });
+	CHECK_EQ(links.Size(), size_t(2));
+	CHECK(links.ByRemote("r3") == nullptr);
+	CHECK(links.ByRemote("r33") != nullptr);
+	CHECK(links.ByIrc("i2") != nullptr);
 }
 
 static void RunTests()
@@ -157,6 +215,9 @@ static void RunTests()
 	TestSplitForWire();
 	TestSanitiseNick();
 	TestHistory();
+	TestTagValues();
+	TestRemoteMsgId();
+	TestLinks();
 }
 
 CHECK_MAIN()

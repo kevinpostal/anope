@@ -38,6 +38,11 @@
 namespace Relay = BridgeServ::Relay;
 namespace Text = BridgeServ::Text;
 
+/* The prefix of the msgid stamped on every line relayed from a remote
+ * network; see Relay::RemoteMsgId. Discord is the only protocol, so this is
+ * one constant rather than a property of the protocol. */
+static constexpr const char *REMOTE_ID_PREFIX = "dc";
+
 class ModuleBridgeServ;
 
 /* The protocols which are available to bridge to. */
@@ -193,6 +198,10 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   /* What was last relayed for a message, keyed by
    * "<protocol>/<channel id>/<message id>". */
   Relay::History relayed;
+
+  /* The IRC messages which were posted to a remote network, in both
+   * directions. */
+  Relay::Links msg_links;
 
   CommandBSAdd cmd_add;
   CommandBSSet cmd_set;
@@ -755,6 +764,52 @@ public:
 
   void SaveBridge(Bridge *bridge) override { bridge->QueueUpdate(); }
 
+  void RememberLink(const Relay::Links::Entry &entry) override {
+    this->msg_links.Remember(entry);
+  }
+
+  Anope::string IrcIdFor(const Anope::string &remote_id) const override {
+    if (const auto *link = this->msg_links.ByRemote(remote_id.str()))
+      return link->irc_msgid;
+    return Relay::RemoteMsgId(REMOTE_ID_PREFIX, remote_id.str());
+  }
+
+  Anope::string RemoteIdFor(const Anope::string &irc_msgid) const override {
+    std::string remote_id;
+    if (Relay::ParseRemoteMsgId(irc_msgid.str(), REMOTE_ID_PREFIX, remote_id))
+      return remote_id;
+    if (const auto *link = this->msg_links.ByIrc(irc_msgid.str()))
+      return link->remote_id;
+    return "";
+  }
+
+  bool QuotedMessage(const Anope::string &remote_id, Anope::string &author,
+                     Anope::string &excerpt,
+                     Anope::string &thread) const override {
+    if (const auto *link = this->msg_links.ByRemote(remote_id.str())) {
+      author = link->author;
+      excerpt = link->excerpt;
+      thread = link->remote_thread;
+      return true;
+    }
+
+    /* A message which came from the remote network is keyed by the
+     * channel it was relayed from, which the id alone does not say; there
+     * is one bridge per remote channel, so try each. */
+    for (const auto *bridge : this->bridges) {
+      const std::string key = bridge->protocol.str() + "/" +
+                              bridge->foreign_channel.str() + "/" +
+                              remote_id.str();
+      if (const auto *entry = this->relayed.Find(key)) {
+        author = entry->author;
+        excerpt = entry->preview;
+        thread = entry->remote_thread;
+        return true;
+      }
+    }
+    return false;
+  }
+
   void RelayToIrc(const BridgeMessage &msg) override {
     if (!IRCD)
       return;
@@ -780,7 +835,9 @@ public:
 
     Relay::History::Entry record;
     record.hash = std::hash<std::string>{}(msg.text.str());
-    record.preview = msg.text.substr(0, 60).str();
+    record.preview = Text::TruncateCodePoints(msg.text.str(), 120);
+    record.author = msg.display.str();
+    record.remote_thread = msg.thread.str();
 
     if (msg.edit) {
       if (!this->relay_edits)
@@ -813,6 +870,20 @@ public:
     }
     const auto wire = Relay::SplitForWire(text, budget, this->max_lines);
 
+    /* The message's identity goes on the first wire line only, which is
+     * the multiline fallback rule: the IRCd allocates ids for the rest.
+     * An edit is a new IRC line and must not reuse the id of the
+     * original. No time= is stamped because InspIRCd's server-time is a
+     * CapTag which replaces any incoming value with its own delivery
+     * time; msgid is different, its module reuses a remote server's
+     * value so that the id is the same on every side. */
+    Anope::map<Anope::string> first_tags;
+    if (!msg.edit)
+      first_tags["msgid"] = Relay::RemoteMsgId(REMOTE_ID_PREFIX, msg.msg_id.str());
+    if (!msg.reply_to.empty())
+      first_tags["+draft/reply"] =
+          Relay::EscapeTagValue(this->IrcIdFor(msg.reply_to).str());
+
     bool sent = false;
     for (const auto &line : wire.lines) {
       if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
@@ -834,7 +905,8 @@ public:
           bridge->throttle.dropped = 0;
         }
       }
-      IRCD->SendPrivmsg(u, bridge->irc_channel, line);
+      IRCD->SendPrivmsg(u, bridge->irc_channel, line,
+                        sent ? Anope::map<Anope::string>{} : first_tags);
       sent = true;
     }
 
@@ -1211,6 +1283,10 @@ public:
     Anope::string ctcp_body;
     BridgeOutbound out;
     out.nick = u->nick;
+    if (const auto it = tags.find("msgid"); it != tags.end())
+      out.msgid = it->second;
+    if (const auto it = tags.find("+draft/reply"); it != tags.end())
+      out.reply_to = Relay::UnescapeTagValue(it->second.str());
 
     Anope::string payload = msg;
     if (Anope::ParseCTCP(msg, ctcp_name, ctcp_body)) {
