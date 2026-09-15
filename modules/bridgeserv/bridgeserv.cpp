@@ -76,6 +76,9 @@ public:
   User *user = nullptr;
   std::set<Anope::string> chans;
   time_t last_active = Anope::CurTime;
+  /* When the client last sent a typing notification; the typing
+   * specification allows one per three seconds per target. */
+  time_t last_typing = 0;
   /* Whether the client is currently marked away on IRC, so that an
    * unchanged presence update does not put AWAY on the wire again. */
   bool away = false;
@@ -181,6 +184,7 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   bool relay_edits = true;
   bool relay_deletes = false;
   bool relay_reactions = true;
+  bool relay_typing = true;
 
   std::vector<Bridge *> bridges;
 
@@ -985,6 +989,34 @@ public:
     IRCD->SendTagmsg(client->user, bridge->irc_channel, tags);
   }
 
+  void RelayTyping(const Anope::string &protocol, const Anope::string &space,
+                   const Anope::string &channel,
+                   const Anope::string &user_id) override {
+    if (!IRCD || !this->relay_typing)
+      return;
+
+    Bridge *bridge = this->FindRemote(protocol, channel);
+    if (!bridge || bridge->irc_channel.empty())
+      return;
+    if (!space.empty() && space != "0" && !bridge->space.equals_ci(space))
+      return;
+
+    BridgeClient *client = this->FindClient(bridge, user_id);
+    if (!client || !client->user)
+      return;
+
+    if (Anope::CurTime - client->last_typing < 3)
+      return;
+    client->last_typing = Anope::CurTime;
+    this->EnsureJoin(client, bridge->irc_channel);
+
+    /* Only "active" is ever sent: the remote network has no paused or
+     * done event, clients time an active notification out on their own,
+     * and the message which follows clears it. */
+    IRCD->SendTagmsg(client->user, bridge->irc_channel,
+                     {{"+typing", "active"}});
+  }
+
   void DeliverListing(const Anope::string &requester, const Anope::string &svc,
                       bool channels, bool failed,
                       const std::vector<Anope::string> &lines) override {
@@ -1227,6 +1259,7 @@ public:
         this->GetClamped<time_t>(block, "floodsecs", "4s", 1, 3600);
     this->relay_edits = block.Get<bool>("relayedits", "yes");
     this->relay_deletes = block.Get<bool>("relaydeletes", "no");
+    this->relay_typing = block.Get<bool>("relaytyping", "yes");
     this->relay_reactions = block.Get<bool>("relayreactions", "yes");
 
     /* Zero disables reaping; anything else is at least a minute so the
@@ -1366,6 +1399,41 @@ public:
       return;
 
     protocol->Relay(bridge, out);
+  }
+
+  /* TAGMSG has no handler of its own in Anope, so the tags of one are seen
+   * from the generic message hook, which runs before the handlers. */
+  EventReturn OnMessage(MessageSource &source, Anope::string &command,
+                        std::vector<Anope::string> &params,
+                        Anope::map<Anope::string> &tags) override {
+    if (!command.equals_ci("TAGMSG") || params.empty() || tags.empty())
+      return EVENT_CONTINUE;
+
+    User *u = source.GetUser();
+    if (!u || u == this->GetClient() || u->server == Me ||
+        this->IsBridgeClient(u))
+      return EVENT_CONTINUE;
+
+    Bridge *bridge = this->FindIrc(params[0]);
+    if (!bridge)
+      return EVENT_CONTINUE;
+
+    BridgeProtocol *protocol = bridge->GetProtocol();
+    if (!protocol || !protocol->IsConnected())
+      return EVENT_CONTINUE;
+
+    /* The remote indicator is for the bridge as a whole and lasts about
+     * ten seconds, so one notification per eight is enough to keep it
+     * up while anyone on IRC is typing. */
+    const auto typing = tags.find("+typing");
+    if (this->relay_typing && typing != tags.end() &&
+        typing->second.equals_ci("active") &&
+        Anope::CurTime - bridge->last_typing_out >= 8) {
+      bridge->last_typing_out = Anope::CurTime;
+      protocol->Typing(bridge);
+    }
+
+    return EVENT_CONTINUE;
   }
 };
 

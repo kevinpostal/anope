@@ -134,6 +134,14 @@ public:
    * TAGMSG from the reacting member's pseudo client. */
   virtual void RelayReaction(const BridgeReaction &reaction) = 0;
 
+  /** Relays a typing notification from a bridged network into its IRC
+   * channel, from the member's pseudo client. A member without a client
+   * is not introduced for one. */
+  virtual void RelayTyping(const Anope::string &protocol,
+                           const Anope::string &space,
+                           const Anope::string &channel,
+                           const Anope::string &user_id) = 0;
+
   /** Records that an IRC message was delivered to the remote network, so
    * that later replies and reactions can be mapped in both directions. */
   virtual void RememberLink(const BridgeServ::Relay::Links::Entry &entry) = 0;
@@ -232,6 +240,10 @@ public:
   /** Relays a message from IRC to the remote channel of a bridge. */
   virtual void Relay(Bridge *bridge, const BridgeOutbound &out) = 0;
 
+  /** Shows the remote channel of a bridge that someone on IRC is typing.
+   * Networks with no such notion leave this alone. */
+  virtual void Typing(Bridge *bridge) { (void)bridge; }
+
   /** Called when the set of bridges has changed in any way. */
   virtual void OnBridgesChanged() {}
 
@@ -291,6 +303,9 @@ public:
 
   /* Throttles relaying into the IRC channel. */
   BridgeServ::Relay::TokenBucket throttle;
+  /* When the remote channel was last told that someone on IRC is typing;
+   * the indicator there is for the bridge as a whole. */
+  time_t last_typing_out = 0;
 
   Bridge() : Serializable("Bridge") {}
 

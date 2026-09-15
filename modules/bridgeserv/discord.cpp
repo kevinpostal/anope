@@ -704,6 +704,23 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
           });
         });
 
+    this->cluster->on_typing_start(
+        [mailbox, filter](const dpp::typing_start_t &event) {
+          const std::string channel_id =
+              BridgedChannel(*filter, event.typing_channel.id);
+          const std::string user_id = event.user_id.str();
+          if (channel_id.empty() || user_id.empty() || filter->IsSelf(user_id))
+            return;
+
+          const Anope::string space = event.typing_guild.id.str();
+          const Anope::string channel = channel_id;
+          const Anope::string who = user_id;
+          mailbox->Post([space, channel, who](DiscordProtocol *protocol) {
+            protocol->core->RelayTyping(protocol->GetName(), space, channel,
+                                        who);
+          });
+        });
+
     /* A guild create carries the members Discord sends up front; DPP then
      * asks for the rest of the roster, which arrives as member chunks. */
     this->cluster->on_guild_create(
@@ -1249,6 +1266,22 @@ public:
     std::replace(plain.begin(), plain.end(), '\n', ' ');
     return "> **" + dpp::utility::markdown_escape(author.str()) +
            "**: " + dpp::utility::markdown_escape(plain) + " " + link + "\n";
+  }
+
+  void Typing(Bridge *bridge) override {
+    if (!this->cluster || !this->connected)
+      return;
+
+    /* Discord has no per-webhook typing, so the indicator shows the bot
+     * account's name rather than the IRC nick; it is still the only way
+     * to show the channel that a reply is being written. */
+    try {
+      this->cluster->channel_typing(
+          dpp::snowflake(bridge->foreign_channel.c_str()));
+    } catch (const dpp::exception &err) {
+      Log(this->core->GetOwner()) << "BridgeServ: unable to show typing in "
+                                  << bridge->irc_channel << ": " << err.what();
+    }
   }
 
   void Relay(Bridge *bridge, const BridgeOutbound &out) override {
