@@ -149,6 +149,17 @@ public:
   bool OnHelp(CommandSource &source, const Anope::string &subcommand) override;
 };
 
+class CommandBSStatus final : public Command {
+  ModuleBridgeServ *module;
+
+public:
+  explicit CommandBSStatus(ModuleBridgeServ *creator);
+
+  void Execute(CommandSource &source,
+               const std::vector<Anope::string> &params) override;
+  bool OnHelp(CommandSource &source, const Anope::string &subcommand) override;
+};
+
 class CommandBSGuilds final : public Command {
   ModuleBridgeServ *module;
 
@@ -213,6 +224,7 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   CommandBSSet cmd_set;
   CommandBSDel cmd_del;
   CommandBSList cmd_list;
+  CommandBSStatus cmd_status;
   CommandBSGuilds cmd_guilds;
   CommandBSChannels cmd_channels;
   BridgeReapTimer reaper;
@@ -922,6 +934,7 @@ public:
       if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
                        Anope::CurTime)) {
         ++bridge->throttle.dropped;
+        ++bridge->stats.dropped;
         continue;
       }
 
@@ -941,6 +954,8 @@ public:
       IRCD->SendPrivmsg(u, bridge->irc_channel, line,
                         sent ? Anope::map<Anope::string>{} : first_tags);
       sent = true;
+      ++bridge->stats.in_lines;
+      bridge->stats.last_in = Anope::CurTime;
     }
 
     /* Only a message which reached the channel is remembered, so that an
@@ -985,6 +1000,7 @@ public:
     if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
                      Anope::CurTime)) {
       ++bridge->throttle.dropped;
+      ++bridge->stats.dropped;
       return;
     }
 
@@ -998,6 +1014,7 @@ public:
     tags[reaction.add ? "+draft/react" : "+draft/unreact"] =
         Relay::EscapeTagValue(reaction.emoji.str());
     IRCD->SendTagmsg(client->user, bridge->irc_channel, tags);
+    ++bridge->stats.reactions_in;
   }
 
   void RelayTyping(const Anope::string &protocol, const Anope::string &space,
@@ -1026,6 +1043,7 @@ public:
      * and the message which follows clears it. */
     IRCD->SendTagmsg(client->user, bridge->irc_channel,
                      {{"+typing", "active"}});
+    ++bridge->stats.typing_in;
   }
 
   void DeliverListing(const Anope::string &requester, const Anope::string &svc,
@@ -1174,6 +1192,26 @@ public:
     return count;
   }
 
+  /** The pseudo clients a bridge holds, and how many of them are away. */
+  void CountClients(const Bridge *bridge, size_t &total, size_t &away) const {
+    total = away = 0;
+    const BridgeProtocol *protocol = bridge->GetProtocol();
+    if (!protocol)
+      return;
+
+    const Anope::string prefix = LinkKey(protocol, bridge->space) + "/" +
+                                 bridge->nick_suffix + "/";
+    for (const auto &[key, client] : this->clients) {
+      if (key.compare(0, prefix.length(), prefix) != 0)
+        continue;
+      ++total;
+      if (client->away)
+        ++away;
+    }
+  }
+
+  size_t CountLinks() const { return this->msg_links.Size(); }
+
   /** Quits pseudo clients which have not spoken for useridle seconds. The
    * nicknames they used stay reserved.
    */
@@ -1206,8 +1244,8 @@ public:
 
   ModuleBridgeServ(const Anope::string &modname, const Anope::string &creator)
       : Module(modname, creator, VENDOR), cmd_add(this), cmd_set(this),
-        cmd_del(this), cmd_list(this), cmd_guilds(this), cmd_channels(this),
-        reaper(this) {
+        cmd_del(this), cmd_list(this), cmd_status(this), cmd_guilds(this),
+        cmd_channels(this), reaper(this) {
     this->SetAuthor("Anope");
     this->SetVersion("1.1");
 
@@ -1392,6 +1430,7 @@ public:
       return;
 
     protocol->Notice(bridge, text);
+    ++bridge->stats.events_out;
   }
 
   void OnJoinChannel(User *u, Channel *c) override {
@@ -1503,6 +1542,8 @@ public:
       return;
 
     protocol->Relay(bridge, out);
+    ++bridge->stats.out_messages;
+    bridge->stats.last_out = Anope::CurTime;
   }
 
   /* TAGMSG has no handler of its own in Anope, so the tags of one are seen
@@ -1555,12 +1596,14 @@ public:
         if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
                          Anope::CurTime)) {
           ++bridge->throttle.dropped;
+          ++bridge->stats.dropped;
         } else {
           Anope::string author, excerpt, thread;
           this->QuotedMessage(remote_id, author, excerpt, thread);
           protocol->React(bridge, remote_id,
                           thread.empty() ? bridge->foreign_channel : thread,
                           emoji, add);
+          ++bridge->stats.reactions_out;
         }
       }
     }
@@ -1990,6 +2033,89 @@ bool CommandBSList::OnHelp(CommandSource &source,
         "endpoint for per-user identity, how many bridged users are "
         "currently in the IRC channel, and how many nicknames it has "
         "reserved on the network."));
+  return true;
+}
+
+CommandBSStatus::CommandBSStatus(ModuleBridgeServ *creator)
+    : Command(creator, "bridgeserv/status", 0, 1), module(creator) {
+  this->SetDesc(_("Show what each bridge has been doing"));
+  this->SetSyntax(_("[\037#channel\037]"));
+}
+
+void CommandBSStatus::Execute(CommandSource &source,
+                              const std::vector<Anope::string> &params) {
+  if (!CheckAccess(source, "bridgeserv/status"))
+    return;
+
+  std::vector<const Bridge *> shown;
+  if (!params.empty()) {
+    const Bridge *bridge = this->module->FindIrc(params[0]);
+    if (!bridge) {
+      source.Reply(_("No such bridge."));
+      return;
+    }
+    shown.push_back(bridge);
+  } else {
+    const auto &bridges = this->module->GetBridges();
+    shown.assign(bridges.begin(), bridges.end());
+  }
+
+  if (shown.empty()) {
+    source.Reply(_("No bridges are configured."));
+    return;
+  }
+
+  const auto ago = [](time_t when) -> Anope::string {
+    if (!when)
+      return _("never");
+    return Anope::Duration(Anope::CurTime - when) + " " + _("ago");
+  };
+
+  for (const auto *bridge : shown) {
+    const BridgeProtocol *protocol = bridge->GetProtocol();
+    const auto &stats = bridge->stats;
+    size_t clients = 0, away = 0;
+    this->module->CountClients(bridge, clients, away);
+
+    source.Reply(_("\002%s\002 <-> %s:%s/%s (%s)"), bridge->irc_channel.c_str(),
+                 bridge->protocol.c_str(), bridge->space.c_str(),
+                 bridge->foreign_channel.c_str(),
+                 protocol && protocol->IsConnected() ? _("connected")
+                                                     : _("not connected"));
+    source.Reply(_("  roster: %zu client(s), %zu away; %zu nick(s) reserved"),
+                 clients, away, bridge->reserved.size());
+    source.Reply(_("  in %lu line(s) / out %lu message(s) / dropped %lu"),
+                 stats.in_lines, stats.out_messages, stats.dropped);
+    source.Reply(_("  reactions %lu/%lu, typing %lu, events %lu"),
+                 stats.reactions_in, stats.reactions_out, stats.typing_in,
+                 stats.events_out);
+    if (bridge->endpoint_id.empty())
+      source.Reply(_("  webhook none, failures %u, retry in %s"),
+                   bridge->endpoint_failures,
+                   bridge->endpoint_retry_at > Anope::CurTime
+                       ? Anope::Duration(bridge->endpoint_retry_at -
+                                         Anope::CurTime)
+                             .c_str()
+                       : "-");
+    else
+      source.Reply(_("  webhook present, failures %u"),
+                   bridge->endpoint_failures);
+    source.Reply(_("  last in %s, last out %s"), ago(stats.last_in).c_str(),
+                 ago(stats.last_out).c_str());
+  }
+  source.Reply(_("%zu message link(s) held."), this->module->CountLinks());
+}
+
+bool CommandBSStatus::OnHelp(CommandSource &source,
+                             const Anope::string &subcommand) {
+  this->SendSyntax(source);
+  source.Reply(" ");
+  source.Reply(
+      _("Shows, for every bridge or the one given, whether its network is "
+        "connected, how many pseudo clients it holds and how many are "
+        "away, how much it has relayed in each direction since the module "
+        "loaded, how many lines the rate limit refused, the state of its "
+        "delivery endpoint, and when it last relayed anything."));
   return true;
 }
 

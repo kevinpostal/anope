@@ -315,6 +315,22 @@ public:
    * reserved until the bridge is deleted. */
   std::set<Anope::string> reserved;
 
+  /* Runtime counters for the STATUS command; not written to the database
+   * and reset when the module loads. */
+  struct Stats final {
+    /* Lines sent into the IRC channel, messages sent to the remote
+     * network, and lines or reactions refused by the flood bucket. */
+    unsigned long in_lines = 0;
+    unsigned long out_messages = 0;
+    unsigned long dropped = 0;
+    unsigned long reactions_in = 0;
+    unsigned long reactions_out = 0;
+    unsigned long typing_in = 0;
+    unsigned long events_out = 0;
+    time_t last_in = 0;
+    time_t last_out = 0;
+  } stats;
+
   /* The protocol-specific endpoint which IRC messages are delivered to (a
    * Discord webhook, for example) and whether one is being set up. */
   Anope::string endpoint_id;
