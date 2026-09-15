@@ -61,6 +61,38 @@ static void TestExpandTokens()
 	CHECK_EQ(ExpandTokens("<@>", resolve), std::string("<@>"));
 }
 
+static void TestExpandMentions()
+{
+	const auto resolve = [](const std::string &nick) -> std::string
+	{
+		return nick == "zodiac" ? "<@1>" : "";
+	};
+	const auto escape = [](const std::string &text)
+	{
+		std::string out;
+		for (const auto chr : text)
+		{
+			if (chr == '*')
+				out.push_back('\\');
+			out.push_back(chr);
+		}
+		return out;
+	};
+
+	// A resolved nick is substituted verbatim; the text around it is escaped.
+	CHECK_EQ(ExpandMentions("hi @zodiac *x*", resolve, escape), std::string("hi <@1> \\*x\\*"));
+	CHECK_EQ(ExpandMentions("@zodiac", resolve, escape), std::string("<@1>"));
+	// Trailing punctuation ends the nick.
+	CHECK_EQ(ExpandMentions("@zodiac: yo", resolve, escape), std::string("<@1>: yo"));
+	// An unknown nick, a bare @, and an email stay literal and escaped.
+	CHECK_EQ(ExpandMentions("@nobody *x*", resolve, escape), std::string("@nobody \\*x\\*"));
+	CHECK_EQ(ExpandMentions("@ @zodiac", resolve, escape), std::string("@ <@1>"));
+	CHECK_EQ(ExpandMentions("mail zodiac@zodiac now", resolve, escape), std::string("mail zodiac@zodiac now"));
+	// Two mentions on one line, and a mention after punctuation.
+	CHECK_EQ(ExpandMentions("(@zodiac @zodiac)", resolve, escape), std::string("(<@1> <@1>)"));
+	CHECK_EQ(ExpandMentions("", resolve, escape), std::string(""));
+}
+
 static void TestEscapeMarkdown()
 {
 	CHECK_EQ(MarkdownToIrc("@" + EscapeMarkdown("**mods**")), std::string("@**mods**"));
@@ -123,6 +155,7 @@ static void RunTests()
 {
 	TestMarkdownToIrc();
 	TestExpandTokens();
+	TestExpandMentions();
 	TestEscapeMarkdown();
 	TestTruncate();
 	TestEscapeLineStart();

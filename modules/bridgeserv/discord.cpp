@@ -234,6 +234,9 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
   Anope::string domain;
   Anope::string webhook_name;
   Anope::string webhook_suffix;
+  /* Whether an IRC "@nick" which names one of this bridge's own pseudo
+   * clients is relayed as a real Discord mention. */
+  bool relay_mentions = false;
 
   /* Whether the privileged GUILD_PRESENCES intent is requested, which
    * decides whether a bridged member can be shown away on IRC. Requesting
@@ -1130,6 +1133,10 @@ public:
     this->webhook_name = name;
     this->webhook_suffix = StripControl(
         block.Get<const Anope::string>("webhooksuffix", " (IRC)").str());
+    /* Whether an IRC "@nick" which names one of this bridge's own pseudo
+     * clients is relayed as a real Discord mention. Off by default: the
+     * upstream contract is that a relayed line pings nobody. */
+    this->relay_mentions = block.Get<bool>("relaymentions", "no");
 
     /* The intent set is fixed when the gateway session is opened, so a
      * change of usepresence needs a fresh connection to take effect. */
@@ -1397,6 +1404,34 @@ public:
     }
   }
 
+  /* Renders an IRC line for Discord: a mention of one of this bridge's own
+   * pseudo clients becomes a real Discord mention, and everything else is
+   * markdown-escaped exactly as the whole body used to be. Every id that
+   * was substituted is collected into `pinged`, which becomes the message's
+   * allowed_mentions allow-list.
+   *
+   * Runs on the Anope thread — Relay() is called straight out of
+   * BridgeCore::OnPrivmsg, never from the DPP thread — so reaching into the
+   * core's nick/id mapping here is safe.
+   */
+  std::string RenderMentions(Bridge *bridge, const std::string &text,
+                             std::vector<dpp::snowflake> &pinged) {
+    const auto escape = [](const std::string &run) {
+      return dpp::utility::markdown_escape(run, true);
+    };
+    if (!this->relay_mentions)
+      return escape(text);
+
+    const auto resolve = [&](const std::string &nick) -> std::string {
+      const Anope::string id = this->core->RemoteIdForNick(bridge, nick);
+      if (id.empty())
+        return "";
+      pinged.emplace_back(id.c_str());
+      return "<@" + id.str() + ">";
+    };
+    return Text::ExpandMentions(text, resolve, escape);
+  }
+
   void Relay(Bridge *bridge, const BridgeOutbound &out) override {
     if (!this->cluster || !this->connected)
       return;
@@ -1407,8 +1442,9 @@ public:
     const std::string quote =
         out.reply_to.empty() ? "" : this->RenderQuote(bridge, out.reply_to, thread_id);
 
+    std::vector<dpp::snowflake> pinged;
     std::string text = Text::EscapeLineStart(
-        dpp::utility::markdown_escape(out.text.str(), true));
+        this->RenderMentions(bridge, out.text.str(), pinged));
 
     /* Discord rejects messages longer than 2000 characters. The body is
      * truncated before the italic markers are added so that an oversized
@@ -1435,9 +1471,10 @@ public:
     const dpp::snowflake channel(bridge->foreign_channel.c_str());
     dpp::message msg(channel, quote + text);
 
-    /* Messages relayed from IRC never ping anybody; the wire payload gets
-     * an empty allowed_mentions.parse list. */
-    msg.set_allowed_mentions(false, false, false, false);
+    /* A relayed line pings only the bridged users its "@nick" mentions
+     * actually resolved to: every parse_* flag stays off, so @everyone, a
+     * role mention, and a raw "<@id>" typed on IRC all stay inert. */
+    msg.set_allowed_mentions(false, false, false, false, pinged, {});
 
     /* The link between the IRC line and what Discord made of it, filled
      * in from the created message once it is known. A line without a
@@ -1502,7 +1539,7 @@ public:
                           quote + "<" +
                               dpp::utility::markdown_escape(out.nick.str()) +
                               "> " + text);
-    fallback.set_allowed_mentions(false, false, false, false);
+    fallback.set_allowed_mentions(false, false, false, false, pinged, {});
     try {
       this->cluster->message_create(fallback, remember);
     } catch (const dpp::exception &err) {

@@ -653,6 +653,26 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
     return it == this->clients.end() ? nullptr : it->second;
   }
 
+  Anope::string RemoteIdForNick(Bridge *bridge,
+                                const Anope::string &nick) override {
+    const User *u = User::Find(nick, true);
+    /* The common case is an ordinary IRC nick, which IsBridgeClient()
+     * rejects without touching the client map. */
+    if (!u || !this->IsBridgeClient(u))
+      return "";
+
+    for (const auto &[_, client] : this->clients) {
+      if (client->user != u)
+        continue;
+      /* FindClient() rebuilds the key from the bridge, so a client of
+       * another space or nick suffix does not match even when it is the
+       * one holding the nickname. */
+      return this->FindClient(bridge, client->user_id) == client ? client->user_id
+                                                                : "";
+    }
+    return "";
+  }
+
   void SyncRoster(const Anope::string &protocol, const Anope::string &space,
                   const std::vector<BridgeMember> &members) override {
     if (!IRCD || members.empty())

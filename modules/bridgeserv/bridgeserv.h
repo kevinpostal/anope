@@ -152,6 +152,16 @@ public:
   /** The remote id an IRC msgid refers to, or "" when it is not known. */
   virtual Anope::string RemoteIdFor(const Anope::string &irc_msgid) const = 0;
 
+  /** The remote id of the bridged client which holds an IRC nickname, or
+   * "" when the nickname is not one of `bridge`'s own clients.
+   *
+   * Scoped to one bridge deliberately: a nickname held by another space's
+   * client names somebody who is not in this channel, and mentioning them
+   * there would reach a stranger or nobody. Not const, because it resolves
+   * through FindClient().
+   */
+  virtual Anope::string RemoteIdForNick(Bridge *bridge, const Anope::string &nick) = 0;
+
   /** Looks up what is known about a remote message for quoting it.
    * @param remote_id The remote message id.
    * @param author The display name of who sent it.

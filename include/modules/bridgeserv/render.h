@@ -133,6 +133,24 @@ namespace BridgeServ::Text
 			return str.compare(pos, std::strlen(delim), delim) == 0;
 		}
 
+		/** Determines whether a character may appear in an IRC nickname.
+		 *
+		 * RFC 2812's nickname characters plus the ones InspIRCd allows.
+		 * The ASCII ranges are spelled out rather than using std::isalnum
+		 * so the result can never depend on the locale: a UTF-8 lead byte
+		 * must not be absorbed into a nickname. Anything a bridge can
+		 * actually hand out is covered, because SanitiseNick() emits only
+		 * [A-Za-z0-9_] and MakeNick() rejects anything IRCD->IsNickValid()
+		 * refuses.
+		 */
+		inline bool NickChar(unsigned char chr)
+		{
+			if ((chr >= 'a' && chr <= 'z') || (chr >= 'A' && chr <= 'Z')
+				|| (chr >= '0' && chr <= '9'))
+				return true;
+			return chr && std::strchr("-_[]\\`^{}|", chr) != nullptr;
+		}
+
 		/** Copies a verbatim (unparsed) span into the output. */
 		inline void CopyRaw(const std::string &str, size_t begin, size_t end, std::string &out)
 		{
@@ -412,6 +430,57 @@ namespace BridgeServ::Text
 			out.append(replacement);
 			pos = close + 1;
 		}
+		return out;
+	}
+
+	/** Renders the "@nick" mentions of an IRC line for a network which has
+	 * a mention syntax of its own.
+	 *
+	 * A mention is an '@' at the start of the line or after a character
+	 * which cannot appear in a nickname, followed by a run of nickname
+	 * characters; "user@host" is therefore not a mention of "host".
+	 *
+	 * The runs between mentions are passed to `escape` and each nickname to
+	 * `resolve`, so a replacement reaches the remote network verbatim while
+	 * everything around it is escaped exactly as the whole body would have
+	 * been. A resolver which returns an empty string leaves the "@nick" as
+	 * escaped literal text, which is what an unknown nickname must do.
+	 *
+	 * @param str The message text, with IRC formatting already removed.
+	 * @param resolve Called with a nickname; returns its replacement.
+	 * @param escape Called with each run of literal text.
+	 * @return The rendered message.
+	 */
+	inline std::string ExpandMentions(const std::string &str,
+		const std::function<std::string(const std::string &nick)> &resolve,
+		const std::function<std::string(const std::string &text)> &escape)
+	{
+		std::string out;
+		out.reserve(str.length());
+		size_t literal = 0;
+		for (size_t pos = 0; pos < str.length(); ++pos)
+		{
+			if (str[pos] != '@')
+				continue;
+			if (pos && Detail::NickChar(static_cast<unsigned char>(str[pos - 1])))
+				continue;
+
+			size_t end = pos + 1;
+			while (end < str.length() && Detail::NickChar(static_cast<unsigned char>(str[end])))
+				++end;
+			if (end == pos + 1)
+				continue;
+
+			const std::string replacement = resolve(str.substr(pos + 1, end - pos - 1));
+			if (replacement.empty())
+				continue;
+
+			out += escape(str.substr(literal, pos - literal));
+			out += replacement;
+			literal = end;
+			pos = end - 1;
+		}
+		out += escape(str.substr(literal));
 		return out;
 	}
 
