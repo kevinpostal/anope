@@ -2426,6 +2426,25 @@ struct IRCDMessageSQuit final
 	}
 };
 
+/* A TAGMSG carries nothing but tags. Services have no use for one, but a
+ * handler means it is a known message rather than a debug log line for
+ * every reaction or typing notification on the network; modules which do
+ * want the tags see them from OnMessage.
+ */
+struct IRCDMessageTagmsg final
+	: IRCDMessage
+{
+	IRCDMessageTagmsg(Module *creator)
+		: IRCDMessage(creator, "TAGMSG", 1)
+	{
+		SetFlag(FLAG_REQUIRE_USER);
+	}
+
+	void Run(MessageSource &source, const std::vector<Anope::string> &params, const Anope::map<Anope::string> &tags) override
+	{
+	}
+};
+
 struct IRCDMessageUID final
 	: IRCDMessage
 {
@@ -2523,6 +2542,7 @@ class ProtoInspIRCd final
 	IRCDMessageSave message_save;
 	IRCDMessageServer message_server;
 	IRCDMessageSQuit message_squit;
+	IRCDMessageTagmsg message_tagmsg;
 	IRCDMessageUID message_uid;
 
 	static void SendChannelMetadata(Channel *c, const Anope::string &metadataname, const Anope::string &value)
@@ -2575,6 +2595,7 @@ public:
 		, message_save(this)
 		, message_server(this)
 		, message_squit(this)
+		, message_tagmsg(this)
 		, message_uid(this)
 	{
 	}

@@ -38,6 +38,11 @@
 namespace Relay = BridgeServ::Relay;
 namespace Text = BridgeServ::Text;
 
+/* The prefix of the msgid stamped on every line relayed from a remote
+ * network; see Relay::RemoteMsgId. Discord is the only protocol, so this is
+ * one constant rather than a property of the protocol. */
+static constexpr const char *REMOTE_ID_PREFIX = "dc";
+
 class ModuleBridgeServ;
 
 /* The protocols which are available to bridge to. */
@@ -71,6 +76,9 @@ public:
   User *user = nullptr;
   std::set<Anope::string> chans;
   time_t last_active = Anope::CurTime;
+  /* When the client last sent a typing notification; the typing
+   * specification allows one per three seconds per target. */
+  time_t last_typing = 0;
   /* Whether the client is currently marked away on IRC, so that an
    * unchanged presence update does not put AWAY on the wire again. */
   bool away = false;
@@ -141,6 +149,17 @@ public:
   bool OnHelp(CommandSource &source, const Anope::string &subcommand) override;
 };
 
+class CommandBSStatus final : public Command {
+  ModuleBridgeServ *module;
+
+public:
+  explicit CommandBSStatus(ModuleBridgeServ *creator);
+
+  void Execute(CommandSource &source,
+               const std::vector<Anope::string> &params) override;
+  bool OnHelp(CommandSource &source, const Anope::string &subcommand) override;
+};
+
 class CommandBSGuilds final : public Command {
   ModuleBridgeServ *module;
 
@@ -175,6 +194,9 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   time_t flood_secs = 4;
   bool relay_edits = true;
   bool relay_deletes = false;
+  bool relay_reactions = true;
+  bool relay_typing = true;
+  std::set<Anope::string, ci::less> relay_events;
 
   std::vector<Bridge *> bridges;
 
@@ -194,10 +216,15 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
    * "<protocol>/<channel id>/<message id>". */
   Relay::History relayed;
 
+  /* The IRC messages which were posted to a remote network, in both
+   * directions. */
+  Relay::Links msg_links;
+
   CommandBSAdd cmd_add;
   CommandBSSet cmd_set;
   CommandBSDel cmd_del;
   CommandBSList cmd_list;
+  CommandBSStatus cmd_status;
   CommandBSGuilds cmd_guilds;
   CommandBSChannels cmd_channels;
   BridgeReapTimer reaper;
@@ -367,8 +394,17 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   /* Pseudo clients                                                     */
   /* ------------------------------------------------------------------ */
 
-  Anope::string MakeNick(const Anope::string &raw,
-                         const Anope::string &suffix,
+  /** Derives the IRC nickname of a pseudo client.
+   *
+   * @param raw The remote display name.
+   * @param suffix The bridge's configured nickname suffix.
+   * @param network The name of the bridged network, used to disambiguate
+   *                a nickname which is already taken.
+   * @param ignore A client which may hold the nickname without counting
+   *               as a collision (the one being renamed).
+   */
+  Anope::string MakeNick(const Anope::string &raw, const Anope::string &suffix,
+                         const Anope::string &network,
                          const User *ignore = nullptr) const {
     /* Leave room for the suffix and for the uniquifying counter. */
     const size_t maxlen = IRCD->MaxNick ? IRCD->MaxNick : 31;
@@ -384,16 +420,34 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
       return "";
 
     const Anope::string candidate = nick;
-    for (unsigned counter = 2;; ++counter) {
+
+    /* A taken nickname is usually the same person's own IRC client, so
+     * the first alternative names the network they are bridged from —
+     * "Zodiac_discord" rather than "Zodiac_2", which says nothing. The
+     * counter is only reached when that is taken too. It is built from
+     * the untruncated candidate where the length allows, so the readable
+     * part is not shortened for everyone who does not collide. */
+    Anope::string tagged;
+    if (!network.empty() && maxlen > network.length() + 1) {
+      const size_t room = maxlen - network.length() - 1;
+      tagged = (candidate.length() > room ? candidate.substr(0, room)
+                                          : candidate) + "_" + network;
+    }
+
+    for (unsigned counter = 0; counter <= 99; ++counter) {
+      if (counter == 1) {
+        if (tagged.empty() || tagged.equals_ci(candidate))
+          continue;
+        nick = tagged;
+      } else if (counter > 1) {
+        nick = candidate + "_" + Anope::ToString(counter);
+      }
+
       const User *held = User::Find(nick, true);
       if ((!held || held == ignore) && IRCD->IsNickValid(nick))
-        break;
-      if (counter > 99)
-        return "";
-
-      nick = candidate + "_" + Anope::ToString(counter);
+        return nick;
     }
-    return nick;
+    return "";
   }
 
   Anope::string MakeIdent(const Anope::string &user_id) {
@@ -443,8 +497,8 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
                            Servers::GetUplink() &&
                                Servers::GetUplink()->IsSynced());
       } else {
-        const Anope::string renamed =
-            this->MakeNick(display, bridge->nick_suffix, client->user);
+        const Anope::string renamed = this->MakeNick(
+            display, bridge->nick_suffix, protocol->GetName(), client->user);
         if (renamed.empty()) {
           Log(this) << "BridgeServ: unable to allocate an IRC nick for the "
                     << "new display name of " << client->user->nick
@@ -457,6 +511,16 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
           Log(this) << "BridgeServ: renamed pseudo client " << previous
                     << " to " << renamed;
         }
+
+        /* The realname carries the display name too, and a case-only
+         * change reaches here without a nick change. Anope has no
+         * outbound realname API; FNAME is what its own inbound handler
+         * relays, and the IRCd shows it to clients as SETNAME. */
+        const Anope::string realname = Anope::Format(
+            "%s (%s)", display.c_str(), protocol->GetName().c_str());
+        client->user->SetRealname(realname);
+        Uplink::Send(client->user, "FNAME", realname);
+
         client->display = display;
         return client;
       }
@@ -466,7 +530,8 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
     if (!link)
       return nullptr;
 
-    const Anope::string nick = this->MakeNick(display, bridge->nick_suffix);
+    const Anope::string nick =
+        this->MakeNick(display, bridge->nick_suffix, protocol->GetName());
     if (nick.empty()) {
       Log(this) << "BridgeServ: unable to allocate an IRC nick for "
                 << protocol->GetName() << " user " << user_id
@@ -755,6 +820,52 @@ public:
 
   void SaveBridge(Bridge *bridge) override { bridge->QueueUpdate(); }
 
+  void RememberLink(const Relay::Links::Entry &entry) override {
+    this->msg_links.Remember(entry);
+  }
+
+  Anope::string IrcIdFor(const Anope::string &remote_id) const override {
+    if (const auto *link = this->msg_links.ByRemote(remote_id.str()))
+      return link->irc_msgid;
+    return Relay::RemoteMsgId(REMOTE_ID_PREFIX, remote_id.str());
+  }
+
+  Anope::string RemoteIdFor(const Anope::string &irc_msgid) const override {
+    std::string remote_id;
+    if (Relay::ParseRemoteMsgId(irc_msgid.str(), REMOTE_ID_PREFIX, remote_id))
+      return remote_id;
+    if (const auto *link = this->msg_links.ByIrc(irc_msgid.str()))
+      return link->remote_id;
+    return "";
+  }
+
+  bool QuotedMessage(const Anope::string &remote_id, Anope::string &author,
+                     Anope::string &excerpt,
+                     Anope::string &thread) const override {
+    if (const auto *link = this->msg_links.ByRemote(remote_id.str())) {
+      author = link->author;
+      excerpt = link->excerpt;
+      thread = link->remote_thread;
+      return true;
+    }
+
+    /* A message which came from the remote network is keyed by the
+     * channel it was relayed from, which the id alone does not say; there
+     * is one bridge per remote channel, so try each. */
+    for (const auto *bridge : this->bridges) {
+      const std::string key = bridge->protocol.str() + "/" +
+                              bridge->foreign_channel.str() + "/" +
+                              remote_id.str();
+      if (const auto *entry = this->relayed.Find(key)) {
+        author = entry->author;
+        excerpt = entry->preview;
+        thread = entry->remote_thread;
+        return true;
+      }
+    }
+    return false;
+  }
+
   void RelayToIrc(const BridgeMessage &msg) override {
     if (!IRCD)
       return;
@@ -780,7 +891,9 @@ public:
 
     Relay::History::Entry record;
     record.hash = std::hash<std::string>{}(msg.text.str());
-    record.preview = msg.text.substr(0, 60).str();
+    record.preview = Text::TruncateCodePoints(msg.text.str(), 120);
+    record.author = msg.display.str();
+    record.remote_thread = msg.thread.str();
 
     if (msg.edit) {
       if (!this->relay_edits)
@@ -805,19 +918,51 @@ public:
     const size_t budget =
         Relay::PayloadBudget(source_len, bridge->irc_channel.length());
 
+    /* Visible markers for clients without the reply tag: what the message
+     * answers and the thread it came from, then the edit marker, so a
+     * line reads "(edit) (reply to X) [thread] text". */
+    std::string prefix;
+    if (!msg.reply_to.empty()) {
+      Anope::string author, excerpt, thread;
+      if (this->QuotedMessage(msg.reply_to, author, excerpt, thread) &&
+          !author.empty())
+        prefix += "(reply to " + author.str() + ") ";
+      else
+        prefix += "(reply) ";
+    }
+    if (!msg.thread_name.empty())
+      prefix += "[" + msg.thread_name.str() + "] ";
+    if (msg.edit)
+      prefix.insert(0, "(edit) ");
+
     std::string text = msg.text.str();
-    if (msg.edit) {
+    if (!prefix.empty()) {
       const size_t at = text.find_first_not_of('\n');
       if (at != std::string::npos)
-        text.insert(at, "(edit) ");
+        text.insert(at, prefix);
     }
     const auto wire = Relay::SplitForWire(text, budget, this->max_lines);
+
+    /* The message's identity goes on the first wire line only, which is
+     * the multiline fallback rule: the IRCd allocates ids for the rest.
+     * An edit is a new IRC line and must not reuse the id of the
+     * original. No time= is stamped because InspIRCd's server-time is a
+     * CapTag which replaces any incoming value with its own delivery
+     * time; msgid is different, its module reuses a remote server's
+     * value so that the id is the same on every side. */
+    Anope::map<Anope::string> first_tags;
+    if (!msg.edit)
+      first_tags["msgid"] = Relay::RemoteMsgId(REMOTE_ID_PREFIX, msg.msg_id.str());
+    if (!msg.reply_to.empty())
+      first_tags["+draft/reply"] =
+          Relay::EscapeTagValue(this->IrcIdFor(msg.reply_to).str());
 
     bool sent = false;
     for (const auto &line : wire.lines) {
       if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
                        Anope::CurTime)) {
         ++bridge->throttle.dropped;
+        ++bridge->stats.dropped;
         continue;
       }
 
@@ -834,8 +979,11 @@ public:
           bridge->throttle.dropped = 0;
         }
       }
-      IRCD->SendPrivmsg(u, bridge->irc_channel, line);
+      IRCD->SendPrivmsg(u, bridge->irc_channel, line,
+                        sent ? Anope::map<Anope::string>{} : first_tags);
       sent = true;
+      ++bridge->stats.in_lines;
+      bridge->stats.last_in = Anope::CurTime;
     }
 
     /* Only a message which reached the channel is remembered, so that an
@@ -850,6 +998,80 @@ public:
           Anope::Format(
               Language::Translate(_("... [message truncated, %zu more lines]")),
               wire.dropped));
+  }
+
+  void RelayReaction(const BridgeReaction &reaction) override {
+    if (!IRCD || !this->relay_reactions)
+      return;
+
+    Bridge *bridge = this->FindRemote(reaction.protocol, reaction.channel);
+    if (!bridge || bridge->irc_channel.empty())
+      return;
+    if (!reaction.space.empty() && reaction.space != "0" &&
+        !bridge->space.equals_ci(reaction.space))
+      return;
+
+    /* Someone without a client is introduced for a reaction as they
+     * would be for a line; a removal from someone without one is nothing
+     * to relay. */
+    BridgeClient *client = this->FindClient(bridge, reaction.user_id);
+    if (!client && reaction.add && !reaction.display.empty())
+      client = this->EnsureClient(bridge, reaction.user_id, reaction.display);
+    if (!client || !client->user)
+      return;
+
+    client->last_active = Anope::CurTime;
+    this->EnsureJoin(client, bridge->irc_channel);
+
+    /* A reaction draws from the same bucket as a line: it is not allowed
+     * to storm the channel either. */
+    if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
+                     Anope::CurTime)) {
+      ++bridge->throttle.dropped;
+      ++bridge->stats.dropped;
+      return;
+    }
+
+    /* SendTagmsg is a no-op on an IRCd which did not advertise TAGMSG;
+     * the protocol module says so once the uplink has negotiated (see
+     * inspircd.cpp's ircv3_ctctags handling), which is the only point at
+     * which the answer is known, so nothing is checked here. */
+    Anope::map<Anope::string> tags;
+    tags["+draft/reply"] =
+        Relay::EscapeTagValue(this->IrcIdFor(reaction.remote_id).str());
+    tags[reaction.add ? "+draft/react" : "+draft/unreact"] =
+        Relay::EscapeTagValue(reaction.emoji.str());
+    IRCD->SendTagmsg(client->user, bridge->irc_channel, tags);
+    ++bridge->stats.reactions_in;
+  }
+
+  void RelayTyping(const Anope::string &protocol, const Anope::string &space,
+                   const Anope::string &channel,
+                   const Anope::string &user_id) override {
+    if (!IRCD || !this->relay_typing)
+      return;
+
+    Bridge *bridge = this->FindRemote(protocol, channel);
+    if (!bridge || bridge->irc_channel.empty())
+      return;
+    if (!space.empty() && space != "0" && !bridge->space.equals_ci(space))
+      return;
+
+    BridgeClient *client = this->FindClient(bridge, user_id);
+    if (!client || !client->user)
+      return;
+
+    if (Anope::CurTime - client->last_typing < 3)
+      return;
+    client->last_typing = Anope::CurTime;
+    this->EnsureJoin(client, bridge->irc_channel);
+
+    /* Only "active" is ever sent: the remote network has no paused or
+     * done event, clients time an active notification out on their own,
+     * and the message which follows clears it. */
+    IRCD->SendTagmsg(client->user, bridge->irc_channel,
+                     {{"+typing", "active"}});
+    ++bridge->stats.typing_in;
   }
 
   void DeliverListing(const Anope::string &requester, const Anope::string &svc,
@@ -998,6 +1220,26 @@ public:
     return count;
   }
 
+  /** The pseudo clients a bridge holds, and how many of them are away. */
+  void CountClients(const Bridge *bridge, size_t &total, size_t &away) const {
+    total = away = 0;
+    const BridgeProtocol *protocol = bridge->GetProtocol();
+    if (!protocol)
+      return;
+
+    const Anope::string prefix = LinkKey(protocol, bridge->space) + "/" +
+                                 bridge->nick_suffix + "/";
+    for (const auto &[key, client] : this->clients) {
+      if (key.compare(0, prefix.length(), prefix) != 0)
+        continue;
+      ++total;
+      if (client->away)
+        ++away;
+    }
+  }
+
+  size_t CountLinks() const { return this->msg_links.Size(); }
+
   /** Quits pseudo clients which have not spoken for useridle seconds. The
    * nicknames they used stay reserved.
    */
@@ -1030,8 +1272,8 @@ public:
 
   ModuleBridgeServ(const Anope::string &modname, const Anope::string &creator)
       : Module(modname, creator, VENDOR), cmd_add(this), cmd_set(this),
-        cmd_del(this), cmd_list(this), cmd_guilds(this), cmd_channels(this),
-        reaper(this) {
+        cmd_del(this), cmd_list(this), cmd_status(this), cmd_guilds(this),
+        cmd_channels(this), reaper(this) {
     this->SetAuthor("Anope");
     this->SetVersion("1.1");
 
@@ -1094,6 +1336,25 @@ public:
         this->GetClamped<time_t>(block, "floodsecs", "4s", 1, 3600);
     this->relay_edits = block.Get<bool>("relayedits", "yes");
     this->relay_deletes = block.Get<bool>("relaydeletes", "no");
+    this->relay_typing = block.Get<bool>("relaytyping", "yes");
+    this->relay_reactions = block.Get<bool>("relayreactions", "yes");
+
+    /* Which IRC channel events are told to the remote network. */
+    this->relay_events.clear();
+    static const std::set<Anope::string, ci::less> known = {
+        "join", "part", "quit", "nick", "topic", "kick"};
+    commasepstream events(block.Get<const Anope::string>("relayevents",
+                                                          "nick,topic,kick"));
+    for (Anope::string token; events.GetToken(token);) {
+      token.trim();
+      if (token.empty())
+        continue;
+      if (known.count(token))
+        this->relay_events.insert(token);
+      else
+        Log(this) << "BridgeServ: unknown relayevents token \"" << token
+                  << "\" ignored.";
+    }
 
     /* Zero disables reaping; anything else is at least a minute so the
      * reaper can not quit a client which just spoke. */
@@ -1175,6 +1436,75 @@ public:
     }
   }
 
+  /* ------------------------------------------------------------------ */
+  /* IRC channel events                                                 */
+  /* ------------------------------------------------------------------ */
+
+  /** Whether what a user does on IRC is relayed as an event: services
+   * clients and our own pseudo clients are not. */
+  bool RelaysEventsFor(const User *u) const {
+    return u && u != this->GetClient() && u->server != Me &&
+           u->server->IsSynced() && !this->IsBridgeClient(u);
+  }
+
+  /** Sends an event about an IRC channel to the network it is bridged to,
+   * if that kind of event is configured to be relayed. */
+  void RelayEvent(Bridge *bridge, const char *kind, const Anope::string &text) {
+    if (!bridge || !this->relay_events.count(kind))
+      return;
+
+    BridgeProtocol *protocol = bridge->GetProtocol();
+    if (!protocol || !protocol->IsConnected())
+      return;
+
+    protocol->Notice(bridge, text);
+    ++bridge->stats.events_out;
+  }
+
+  void OnJoinChannel(User *u, Channel *c) override {
+    if (this->RelaysEventsFor(u))
+      this->RelayEvent(this->FindIrc(c->name), "join", u->nick + " joined");
+  }
+
+  void OnPartChannel(User *u, Channel *c, const Anope::string &channel,
+                     const Anope::string &msg) override {
+    if (this->RelaysEventsFor(u))
+      this->RelayEvent(this->FindIrc(channel), "part",
+                       u->nick + " left" + (msg.empty() ? "" : " (" + msg + ")"));
+  }
+
+  void OnUserNickChange(User *u, const Anope::string &oldnick) override {
+    if (!this->RelaysEventsFor(u))
+      return;
+
+    for (const auto &[c, _] : u->chans)
+      this->RelayEvent(this->FindIrc(c->name), "nick",
+                       oldnick + " is now known as " + u->nick);
+  }
+
+  void OnTopicUpdated(User *source, Channel *c, const Anope::string &user,
+                      const Anope::string &topic) override {
+    /* Only a topic set by a real user is an event; services restoring
+     * one on channel creation has no source. */
+    if (!this->RelaysEventsFor(source))
+      return;
+
+    this->RelayEvent(this->FindIrc(c->name), "topic",
+                     topic.empty() ? user + " cleared the topic"
+                                   : user + " changed the topic to: " + topic);
+  }
+
+  void OnUserKicked(const MessageSource &source, User *target,
+                    const Anope::string &channel, ChannelStatus &status,
+                    const Anope::string &kickmsg) override {
+    if (!this->RelaysEventsFor(target))
+      return;
+
+    this->RelayEvent(this->FindIrc(channel), "kick",
+                     source.GetSource() + " kicked " + target->nick +
+                         (kickmsg.empty() ? "" : " (" + kickmsg + ")"));
+  }
+
   void OnUserQuit(User *u, const Anope::string &msg) override {
     if (!u)
       return;
@@ -1185,8 +1515,16 @@ public:
 
       delete it->second;
       this->clients.erase(it);
-      break;
+      return;
     }
+
+    /* The user's channels are still known here; they go with the user. */
+    if (!this->RelaysEventsFor(u))
+      return;
+
+    for (const auto &[c, _] : u->chans)
+      this->RelayEvent(this->FindIrc(c->name), "quit",
+                       u->nick + " quit" + (msg.empty() ? "" : " (" + msg + ")"));
   }
 
   void OnPrivmsg(User *u, Channel *c, Anope::string &msg,
@@ -1211,6 +1549,10 @@ public:
     Anope::string ctcp_body;
     BridgeOutbound out;
     out.nick = u->nick;
+    if (const auto it = tags.find("msgid"); it != tags.end())
+      out.msgid = it->second;
+    if (const auto it = tags.find("+draft/reply"); it != tags.end())
+      out.reply_to = Relay::UnescapeTagValue(it->second.str());
 
     Anope::string payload = msg;
     if (Anope::ParseCTCP(msg, ctcp_name, ctcp_body)) {
@@ -1228,6 +1570,73 @@ public:
       return;
 
     protocol->Relay(bridge, out);
+    ++bridge->stats.out_messages;
+    bridge->stats.last_out = Anope::CurTime;
+  }
+
+  /* TAGMSG has no handler of its own in Anope, so the tags of one are seen
+   * from the generic message hook, which runs before the handlers. */
+  EventReturn OnMessage(MessageSource &source, Anope::string &command,
+                        std::vector<Anope::string> &params,
+                        Anope::map<Anope::string> &tags) override {
+    if (!command.equals_ci("TAGMSG") || params.empty() || tags.empty())
+      return EVENT_CONTINUE;
+
+    User *u = source.GetUser();
+    if (!u || u == this->GetClient() || u->server == Me ||
+        this->IsBridgeClient(u))
+      return EVENT_CONTINUE;
+
+    Bridge *bridge = this->FindIrc(params[0]);
+    if (!bridge)
+      return EVENT_CONTINUE;
+
+    BridgeProtocol *protocol = bridge->GetProtocol();
+    if (!protocol || !protocol->IsConnected())
+      return EVENT_CONTINUE;
+
+    /* The remote indicator is for the bridge as a whole and lasts about
+     * ten seconds, so one notification per eight is enough to keep it
+     * up while anyone on IRC is typing. */
+    const auto typing = tags.find("+typing");
+    if (this->relay_typing && typing != tags.end() &&
+        typing->second.equals_ci("active") &&
+        Anope::CurTime - bridge->last_typing_out >= 8) {
+      bridge->last_typing_out = Anope::CurTime;
+      protocol->Typing(bridge);
+    }
+
+    /* A reaction names the message it is on with +draft/reply; one on a
+     * message which did not cross the bridge, or which is no longer
+     * remembered, has nowhere to go. */
+    const auto react = tags.find("+draft/react");
+    const auto unreact = tags.find("+draft/unreact");
+    const auto reply = tags.find("+draft/reply");
+    const bool add = react != tags.end();
+    if (this->relay_reactions && reply != tags.end() &&
+        (add || unreact != tags.end())) {
+      const Anope::string emoji =
+          Relay::UnescapeTagValue((add ? react : unreact)->second.str());
+      const Anope::string remote_id =
+          this->RemoteIdFor(Relay::UnescapeTagValue(reply->second.str()));
+      if (!emoji.empty() && !remote_id.empty()) {
+        /* Reactions draw from the bridge's bucket like lines do. */
+        if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
+                         Anope::CurTime)) {
+          ++bridge->throttle.dropped;
+          ++bridge->stats.dropped;
+        } else {
+          Anope::string author, excerpt, thread;
+          this->QuotedMessage(remote_id, author, excerpt, thread);
+          protocol->React(bridge, remote_id,
+                          thread.empty() ? bridge->foreign_channel : thread,
+                          emoji, add);
+          ++bridge->stats.reactions_out;
+        }
+      }
+    }
+
+    return EVENT_CONTINUE;
   }
 };
 
@@ -1652,6 +2061,89 @@ bool CommandBSList::OnHelp(CommandSource &source,
         "endpoint for per-user identity, how many bridged users are "
         "currently in the IRC channel, and how many nicknames it has "
         "reserved on the network."));
+  return true;
+}
+
+CommandBSStatus::CommandBSStatus(ModuleBridgeServ *creator)
+    : Command(creator, "bridgeserv/status", 0, 1), module(creator) {
+  this->SetDesc(_("Show what each bridge has been doing"));
+  this->SetSyntax(_("[\037#channel\037]"));
+}
+
+void CommandBSStatus::Execute(CommandSource &source,
+                              const std::vector<Anope::string> &params) {
+  if (!CheckAccess(source, "bridgeserv/status"))
+    return;
+
+  std::vector<const Bridge *> shown;
+  if (!params.empty()) {
+    const Bridge *bridge = this->module->FindIrc(params[0]);
+    if (!bridge) {
+      source.Reply(_("No such bridge."));
+      return;
+    }
+    shown.push_back(bridge);
+  } else {
+    const auto &bridges = this->module->GetBridges();
+    shown.assign(bridges.begin(), bridges.end());
+  }
+
+  if (shown.empty()) {
+    source.Reply(_("No bridges are configured."));
+    return;
+  }
+
+  const auto ago = [](time_t when) -> Anope::string {
+    if (!when)
+      return _("never");
+    return Anope::Duration(Anope::CurTime - when) + " " + _("ago");
+  };
+
+  for (const auto *bridge : shown) {
+    const BridgeProtocol *protocol = bridge->GetProtocol();
+    const auto &stats = bridge->stats;
+    size_t clients = 0, away = 0;
+    this->module->CountClients(bridge, clients, away);
+
+    source.Reply(_("\002%s\002 <-> %s:%s/%s (%s)"), bridge->irc_channel.c_str(),
+                 bridge->protocol.c_str(), bridge->space.c_str(),
+                 bridge->foreign_channel.c_str(),
+                 protocol && protocol->IsConnected() ? _("connected")
+                                                     : _("not connected"));
+    source.Reply(_("  roster: %zu client(s), %zu away; %zu nick(s) reserved"),
+                 clients, away, bridge->reserved.size());
+    source.Reply(_("  in %lu line(s) / out %lu message(s) / dropped %lu"),
+                 stats.in_lines, stats.out_messages, stats.dropped);
+    source.Reply(_("  reactions %lu/%lu, typing %lu, events %lu"),
+                 stats.reactions_in, stats.reactions_out, stats.typing_in,
+                 stats.events_out);
+    if (bridge->endpoint_id.empty())
+      source.Reply(_("  webhook none, failures %u, retry in %s"),
+                   bridge->endpoint_failures,
+                   bridge->endpoint_retry_at > Anope::CurTime
+                       ? Anope::Duration(bridge->endpoint_retry_at -
+                                         Anope::CurTime)
+                             .c_str()
+                       : "-");
+    else
+      source.Reply(_("  webhook present, failures %u"),
+                   bridge->endpoint_failures);
+    source.Reply(_("  last in %s, last out %s"), ago(stats.last_in).c_str(),
+                 ago(stats.last_out).c_str());
+  }
+  source.Reply(_("%zu message link(s) held."), this->module->CountLinks());
+}
+
+bool CommandBSStatus::OnHelp(CommandSource &source,
+                             const Anope::string &subcommand) {
+  this->SendSyntax(source);
+  source.Reply(" ");
+  source.Reply(
+      _("Shows, for every bridge or the one given, whether its network is "
+        "connected, how many pseudo clients it holds and how many are "
+        "away, how much it has relayed in each direction since the module "
+        "loaded, how many lines the rate limit refused, the state of its "
+        "delivery endpoint, and when it last relayed anything."));
   return true;
 }
 

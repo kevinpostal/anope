@@ -42,6 +42,12 @@ struct BridgeMessage final {
   Anope::string msg_id;
   /* The message, rendered as IRC-ready text. */
   Anope::string text;
+  /* The remote id of the message this one replies to, if any. */
+  Anope::string reply_to;
+  /* The remote thread it was posted in, and that thread's display name,
+   * when it was not posted in the bridged channel itself. */
+  Anope::string thread;
+  Anope::string thread_name;
 
   bool edit = false;
   bool del = false;
@@ -55,6 +61,28 @@ struct BridgeOutbound final {
   Anope::string text;
   /* Whether the message was a CTCP ACTION. */
   bool action = false;
+  /* The IRC msgid of the line, and the msgid of the line it replies to
+   * (already unescaped), when the IRCd supplied them. */
+  Anope::string msgid;
+  Anope::string reply_to;
+};
+
+/** A reaction added to, or removed from, a message on a bridged network. */
+struct BridgeReaction final {
+  Anope::string protocol;
+  Anope::string space;
+  /* The bridged channel: the parent when the message is in a thread. */
+  Anope::string channel;
+  /* Who reacted. The display name is only known, and only needed, when a
+   * reaction is added: a removal from someone without a client is
+   * nothing to relay. */
+  Anope::string user_id;
+  Anope::string display;
+  /* The remote id of the message reacted to. */
+  Anope::string remote_id;
+  /* The emoji: a unicode sequence as-is, or ":name:" for a custom one. */
+  Anope::string emoji;
+  bool add = true;
 };
 
 /** One member of a bridged space, as the roster sees them.
@@ -101,6 +129,39 @@ public:
 
   /** Relays a message from a bridged network into its IRC channel. */
   virtual void RelayToIrc(const BridgeMessage &msg) = 0;
+
+  /** Relays a reaction from a bridged network into its IRC channel, as a
+   * TAGMSG from the reacting member's pseudo client. */
+  virtual void RelayReaction(const BridgeReaction &reaction) = 0;
+
+  /** Relays a typing notification from a bridged network into its IRC
+   * channel, from the member's pseudo client. A member without a client
+   * is not introduced for one. */
+  virtual void RelayTyping(const Anope::string &protocol,
+                           const Anope::string &space,
+                           const Anope::string &channel,
+                           const Anope::string &user_id) = 0;
+
+  /** Records that an IRC message was delivered to the remote network, so
+   * that later replies and reactions can be mapped in both directions. */
+  virtual void RememberLink(const BridgeServ::Relay::Links::Entry &entry) = 0;
+
+  /** The IRC msgid to use when IRC needs to refer to a remote message. */
+  virtual Anope::string IrcIdFor(const Anope::string &remote_id) const = 0;
+
+  /** The remote id an IRC msgid refers to, or "" when it is not known. */
+  virtual Anope::string RemoteIdFor(const Anope::string &irc_msgid) const = 0;
+
+  /** Looks up what is known about a remote message for quoting it.
+   * @param remote_id The remote message id.
+   * @param author The display name of who sent it.
+   * @param excerpt The start of its text.
+   * @param thread The remote thread it lives in, or "" for the channel.
+   * @return Whether the message is still remembered.
+   */
+  virtual bool QuotedMessage(const Anope::string &remote_id,
+                             Anope::string &author, Anope::string &excerpt,
+                             Anope::string &thread) const = 0;
 
   /** Introduces (or updates) the members of a bridged space and joins them
    * to every IRC channel bridged to it.
@@ -179,6 +240,33 @@ public:
   /** Relays a message from IRC to the remote channel of a bridge. */
   virtual void Relay(Bridge *bridge, const BridgeOutbound &out) = 0;
 
+  /** Shows the remote channel of a bridge that someone on IRC is typing.
+   * Networks with no such notion leave this alone. */
+  virtual void Typing(Bridge *bridge) { (void)bridge; }
+
+  /** Adds or removes a reaction on a remote message on behalf of IRC.
+   * @param remote_id The remote message.
+   * @param channel The remote channel or thread the message lives in.
+   * @param emoji A unicode emoji as-is, or ":name:" for a custom one.
+   */
+  virtual void React(Bridge *bridge, const Anope::string &remote_id,
+                     const Anope::string &channel, const Anope::string &emoji,
+                     bool add) {
+    (void)bridge;
+    (void)remote_id;
+    (void)channel;
+    (void)emoji;
+    (void)add;
+  }
+
+  /** Tells the remote channel of a bridge about something which happened
+   * on the IRC side (a nick change, a topic, a kick). The text is literal
+   * and comes from the service, not from a user. */
+  virtual void Notice(Bridge *bridge, const Anope::string &text) {
+    (void)bridge;
+    (void)text;
+  }
+
   /** Called when the set of bridges has changed in any way. */
   virtual void OnBridgesChanged() {}
 
@@ -227,6 +315,22 @@ public:
    * reserved until the bridge is deleted. */
   std::set<Anope::string> reserved;
 
+  /* Runtime counters for the STATUS command; not written to the database
+   * and reset when the module loads. */
+  struct Stats final {
+    /* Lines sent into the IRC channel, messages sent to the remote
+     * network, and lines or reactions refused by the flood bucket. */
+    unsigned long in_lines = 0;
+    unsigned long out_messages = 0;
+    unsigned long dropped = 0;
+    unsigned long reactions_in = 0;
+    unsigned long reactions_out = 0;
+    unsigned long typing_in = 0;
+    unsigned long events_out = 0;
+    time_t last_in = 0;
+    time_t last_out = 0;
+  } stats;
+
   /* The protocol-specific endpoint which IRC messages are delivered to (a
    * Discord webhook, for example) and whether one is being set up. */
   Anope::string endpoint_id;
@@ -238,6 +342,9 @@ public:
 
   /* Throttles relaying into the IRC channel. */
   BridgeServ::Relay::TokenBucket throttle;
+  /* When the remote channel was last told that someone on IRC is typing;
+   * the indicator there is for the bridge as a whole. */
+  time_t last_typing_out = 0;
 
   Bridge() : Serializable("Bridge") {}
 

@@ -279,6 +279,85 @@ namespace BridgeServ::Relay
 		return base;
 	}
 
+	/** Escapes a value for an IRCv3 message tag.
+	 *
+	 * Anope writes tag values onto the wire as given, so every value the
+	 * bridge puts on a tag goes through here and every value it reads back
+	 * goes through UnescapeTagValue(). The table is the one from the
+	 * message-tags specification: ';' -> "\:", ' ' -> "\s", '\' -> "\\",
+	 * CR -> "\r", LF -> "\n".
+	 */
+	inline std::string EscapeTagValue(const std::string &raw)
+	{
+		std::string out;
+		out.reserve(raw.length());
+		for (const auto chr : raw)
+		{
+			switch (chr)
+			{
+				case ';':  out += "\\:"; break;
+				case ' ':  out += "\\s"; break;
+				case '\\': out += "\\\\"; break;
+				case '\r': out += "\\r"; break;
+				case '\n': out += "\\n"; break;
+				default:   out.push_back(chr); break;
+			}
+		}
+		return out;
+	}
+
+	/** The inverse of EscapeTagValue(). A backslash before any other
+	 * character yields that character, and a trailing lone backslash is
+	 * dropped, as the specification requires of a parser.
+	 */
+	inline std::string UnescapeTagValue(const std::string &escaped)
+	{
+		std::string out;
+		out.reserve(escaped.length());
+		for (size_t pos = 0; pos < escaped.length(); ++pos)
+		{
+			if (escaped[pos] != '\\')
+			{
+				out.push_back(escaped[pos]);
+				continue;
+			}
+			if (++pos >= escaped.length())
+				break;
+			switch (escaped[pos])
+			{
+				case ':': out.push_back(';'); break;
+				case 's': out.push_back(' '); break;
+				case 'r': out.push_back('\r'); break;
+				case 'n': out.push_back('\n'); break;
+				default:  out.push_back(escaped[pos]); break;
+			}
+		}
+		return out;
+	}
+
+	/** The IRC msgid the bridge stamps on a message it relayed from a
+	 * remote network: "<protocol prefix>-<remote id>", "dc-<snowflake>"
+	 * for Discord. The mapping is stateless in both directions, which is
+	 * what lets a reply or a reaction to a relayed message be resolved
+	 * long after the message itself has been forgotten.
+	 */
+	inline std::string RemoteMsgId(const std::string &protocol_prefix, const std::string &remote_id)
+	{
+		return protocol_prefix + "-" + remote_id;
+	}
+
+	/** Recovers the remote id from a msgid made by RemoteMsgId().
+	 * @return Whether the msgid was one of ours for that protocol.
+	 */
+	inline bool ParseRemoteMsgId(const std::string &msgid, const std::string &protocol_prefix, std::string &remote_id)
+	{
+		const std::string prefix = protocol_prefix + "-";
+		if (msgid.length() <= prefix.length() || msgid.compare(0, prefix.length(), prefix) != 0)
+			return false;
+		remote_id = msgid.substr(prefix.length());
+		return true;
+	}
+
 	/** What was last relayed for each recent message, so that an edit is
 	 * only relayed when something visible changed and a delete notice can
 	 * quote the message. The oldest entry is evicted at capacity.
@@ -291,7 +370,13 @@ namespace BridgeServ::Relay
 			/* Covers the whole rendering, so an edit beyond the preview is
 			 * still seen as a change. */
 			size_t hash = 0;
+			/* The first 120 code points of the rendering, which a delete
+			 * notice quotes and a reply from IRC is decorated with. */
 			std::string preview;
+			/* Who sent it, and the remote thread it was sent in (empty
+			 * when it was sent in the channel itself). */
+			std::string author;
+			std::string remote_thread;
 		};
 
 	private:
@@ -345,6 +430,90 @@ namespace BridgeServ::Relay
 		size_t Size() const
 		{
 			return this->entries.size();
+		}
+	};
+
+	/** The messages which originated on IRC and were posted to a remote
+	 * network, so that a later reply or reaction on either side can be
+	 * mapped to the other. There is no stateless id for these: the remote
+	 * network allocates the id when the message is posted. The oldest link
+	 * is evicted at capacity.
+	 */
+	class Links final
+	{
+	public:
+		struct Entry final
+		{
+			std::string irc_msgid;
+			/* The id the remote network gave the message, and the channel
+			 * and thread (empty when none) it was posted into. */
+			std::string remote_id;
+			std::string remote_channel;
+			std::string remote_thread;
+			/* The IRC nickname at the time, and the first 120 code points
+			 * of the text, for quoting. */
+			std::string author;
+			std::string excerpt;
+		};
+
+	private:
+		const size_t capacity;
+		std::unordered_map<std::string, Entry> by_irc;
+		/* remote id -> irc msgid */
+		std::unordered_map<std::string, std::string> by_remote;
+		std::deque<std::string> order;
+
+		void Drop(const std::string &irc_msgid)
+		{
+			const auto it = this->by_irc.find(irc_msgid);
+			if (it == this->by_irc.end())
+				return;
+			this->by_remote.erase(it->second.remote_id);
+			this->by_irc.erase(it);
+		}
+
+	public:
+		explicit Links(size_t cap = 1024)
+			: capacity(cap ? cap : 1)
+		{
+		}
+
+		/** Records, or replaces, the link of an IRC message. */
+		void Remember(Entry entry)
+		{
+			const bool replaced = this->by_irc.count(entry.irc_msgid);
+			if (replaced)
+				this->Drop(entry.irc_msgid);
+
+			this->by_remote[entry.remote_id] = entry.irc_msgid;
+			const std::string key = entry.irc_msgid;
+			this->by_irc.emplace(key, std::move(entry));
+			if (replaced)
+				return;
+
+			this->order.push_back(key);
+			while (this->order.size() > this->capacity)
+			{
+				this->Drop(this->order.front());
+				this->order.pop_front();
+			}
+		}
+
+		const Entry *ByIrc(const std::string &irc_msgid) const
+		{
+			const auto it = this->by_irc.find(irc_msgid);
+			return it == this->by_irc.end() ? nullptr : &it->second;
+		}
+
+		const Entry *ByRemote(const std::string &remote_id) const
+		{
+			const auto it = this->by_remote.find(remote_id);
+			return it == this->by_remote.end() ? nullptr : this->ByIrc(it->second);
+		}
+
+		size_t Size() const
+		{
+			return this->by_irc.size();
 		}
 	};
 }

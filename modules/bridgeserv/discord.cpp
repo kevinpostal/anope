@@ -36,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+namespace Relay = BridgeServ::Relay;
 namespace Text = BridgeServ::Text;
 
 class DiscordProtocol;
@@ -98,6 +99,12 @@ class DiscordFilter final {
 
   /* The presence Discord last reported per user id. */
   std::unordered_map<std::string, dpp::presence_status> presences;
+
+  /* The custom emoji of each guild, name -> id, snapshotted from the
+   * gateway so that the main thread can resolve ":name:" without reading
+   * DPP's cache from the wrong thread. */
+  std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+      custom_emoji;
 
 public:
   bool IsBridged(const std::string &channel_id) {
@@ -184,6 +191,24 @@ public:
 
     status = it->second;
     return true;
+  }
+
+  /** Replaces the custom emoji known for a guild. */
+  void SetCustomEmoji(const std::string &guild_id,
+                      std::unordered_map<std::string, std::string> by_name) {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    this->custom_emoji[guild_id] = std::move(by_name);
+  }
+
+  /** The id of a guild's custom emoji, or "" if it has none of that name. */
+  std::string CustomEmoji(const std::string &guild_id,
+                          const std::string &name) {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    const auto guild = this->custom_emoji.find(guild_id);
+    if (guild == this->custom_emoji.end())
+      return "";
+    const auto it = guild->second.find(name);
+    return it == guild->second.end() ? "" : it->second;
   }
 };
 
@@ -286,20 +311,49 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
       const size_t shown = std::min<size_t>(msg.attachments.size(), 4);
       for (size_t idx = 0; idx < shown; ++idx) {
         const auto &attachment = msg.attachments[idx];
-        text += " [" + attachment.filename + ": " + attachment.url + "]";
+        /* Media is labelled by what it is; anything else by its name. */
+        const std::string &type = attachment.content_type;
+        if (type.compare(0, 6, "image/") == 0)
+          text += " [image: " + attachment.url + "]";
+        else if (type.compare(0, 6, "video/") == 0)
+          text += " [video: " + attachment.url + "]";
+        else if (type.compare(0, 6, "audio/") == 0)
+          text += " [audio: " + attachment.url + "]";
+        else
+          text += " [file: " + attachment.filename + " " + attachment.url + "]";
       }
       if (msg.attachments.size() > shown)
         text +=
             " [+" + std::to_string(msg.attachments.size() - shown) + " more]";
     }
 
-    for (const auto &sticker : msg.stickers)
-      text += " [sticker: " + sticker.name + "]";
+    /* A sticker is an image the CDN serves by id; a Lottie sticker is a
+     * vector animation with no image form, so only its name is shown. */
+    for (const auto &sticker : msg.stickers) {
+      text += " [sticker: " + sticker.name;
+      switch (sticker.format_type) {
+      case dpp::sf_png:
+      case dpp::sf_apng:
+        text += " https://media.discordapp.net/stickers/" + sticker.id.str() + ".png";
+        break;
+      case dpp::sf_gif:
+        text += " https://media.discordapp.net/stickers/" + sticker.id.str() + ".gif";
+        break;
+      default:
+        break;
+      }
+      text += "]";
+    }
 
-    /* An embed is only interesting when there is nothing else to show;
-     * most embeds are just an unfurled link which is in the content. */
-    if (text.empty() && !msg.embeds.empty()) {
-      const auto &embed = msg.embeds.front();
+    /* A rich embed is bot output which has no other representation, so
+     * it is always rendered. Every other kind (link, image, video, gifv,
+     * article) is Discord's automatic preview of a URL which is already
+     * in the content, so those are only shown when there is nothing
+     * else. */
+    for (const auto &embed : msg.embeds) {
+      if (embed.type != "rich" && !text.empty())
+        continue;
+
       std::string summary = embed.title;
       if (!embed.description.empty())
         summary += (summary.empty() ? "" : " \xe2\x80\x94 ") +
@@ -310,8 +364,9 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
         summary += " [" + embed.fields[idx].name + ": " +
                    Text::TruncateCodePoints(embed.fields[idx].value, 100) + "]";
 
-      if (!summary.empty())
-        text = "[embed] " + render(summary);
+      if (summary.empty())
+        continue;
+      text += (text.empty() ? "" : "\n") + std::string("[embed] ") + render(summary);
     }
 
     /* A forwarded message carries its content in a snapshot. */
@@ -327,12 +382,6 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
       }
     }
 
-    /* A forward references the original message too, but is not a reply
-     * to it. */
-    if (!text.empty() && msg.message_reference.message_id &&
-        !msg.has_snapshot())
-      text.insert(0, "(reply) ");
-
     /* Carriage returns and NULs can not be sent to IRC; newlines are
      * handled by the line splitter when the message is relayed. */
     std::string clean;
@@ -342,6 +391,24 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
         clean += chr;
     }
     return clean;
+  }
+
+  /** The text of a reaction emoji as IRC sees it: a unicode emoji as-is,
+   * a guild's custom emoji as ":name:", the same shape RenderMessage
+   * gives one in a message. */
+  static std::string EmojiText(const dpp::emoji &emoji) {
+    return emoji.id ? ":" + emoji.name + ":" : emoji.name;
+  }
+
+  /** Records the custom emoji of a guild, by name, from DPP's cache. */
+  static void SnapshotEmoji(DiscordFilter &filter, dpp::snowflake guild_id,
+                            const std::vector<dpp::snowflake> &ids) {
+    std::unordered_map<std::string, std::string> by_name;
+    for (const auto id : ids) {
+      if (const auto *emoji = dpp::find_emoji(id))
+        by_name[emoji->name] = id.str();
+    }
+    filter.SetCustomEmoji(guild_id.str(), std::move(by_name));
   }
 
   /** Resolves the bridged channel a Discord channel maps to: itself, or
@@ -388,6 +455,20 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
     relay.user_id = msg.author.id.str();
     relay.msg_id = msg.id.str();
     relay.edit = edit;
+
+    /* A forward references the original message too, but is not a reply
+     * to it. */
+    if (msg.message_reference.message_id &&
+        msg.message_reference.type == dpp::mrt_default && !msg.has_snapshot())
+      relay.reply_to = msg.message_reference.message_id.str();
+
+    /* A message in a thread of the bridged channel is relayed into the
+     * same IRC channel, labelled with the thread it came from. */
+    if (msg.channel_id.str() != channel_id) {
+      relay.thread = msg.channel_id.str();
+      if (const auto *thread = dpp::find_channel(msg.channel_id))
+        relay.thread_name = thread->name;
+    }
 
     std::string display = msg.member.get_nickname();
     if (display.empty())
@@ -526,10 +607,12 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
      * Discord sends no member list and the IRC channel can only ever show
      * the people who have spoken. GUILD_PRESENCES is only added when the
      * operator has enabled it, because an intent the application is not
-     * approved for is answered with gateway close 4014. */
-    uint32_t intents =
-        dpp::i_guilds | dpp::i_guild_messages | dpp::i_message_content |
-        dpp::i_guild_members;
+     * approved for is answered with gateway close 4014. Reactions and
+     * typing are not privileged and are always requested. */
+    uint32_t intents = dpp::i_guilds | dpp::i_guild_messages |
+                       dpp::i_message_content | dpp::i_guild_members |
+                       dpp::i_guild_message_reactions |
+                       dpp::i_guild_message_typing;
     if (this->use_presence)
       intents |= dpp::i_guild_presences;
 
@@ -601,12 +684,92 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
       });
     });
 
+    /* Reactions are relayed from the reacting member's pseudo client.
+     * Clearing every reaction, or every reaction of one emoji, carries no
+     * per-user information to attribute an unreact to, so those two
+     * events are left alone. */
+    this->cluster->on_message_reaction_add(
+        [mailbox, filter](const dpp::message_reaction_add_t &event) {
+          const std::string channel_id =
+              BridgedChannel(*filter, event.channel_id);
+          const std::string user_id = event.reacting_user.id.str();
+          if (channel_id.empty() || user_id.empty() || filter->IsSelf(user_id))
+            return;
+
+          BridgeReaction reaction;
+          reaction.protocol = "discord";
+          reaction.space = event.reacting_guild.id.str();
+          reaction.channel = channel_id;
+          reaction.user_id = user_id;
+          reaction.remote_id = event.message_id.str();
+          reaction.emoji = EmojiText(event.reacting_emoji);
+          reaction.add = true;
+
+          std::string display = MemberDisplay(event.reacting_member);
+          if (display.empty())
+            display = event.reacting_user.global_name;
+          if (display.empty())
+            display = event.reacting_user.username;
+          reaction.display = display;
+
+          mailbox->Post([reaction](DiscordProtocol *protocol) {
+            protocol->core->RelayReaction(reaction);
+          });
+        });
+
+    this->cluster->on_message_reaction_remove(
+        [mailbox, filter](const dpp::message_reaction_remove_t &event) {
+          const std::string channel_id =
+              BridgedChannel(*filter, event.channel_id);
+          const std::string user_id = event.reacting_user_id.str();
+          if (channel_id.empty() || user_id.empty() || filter->IsSelf(user_id))
+            return;
+
+          BridgeReaction reaction;
+          reaction.protocol = "discord";
+          reaction.space = event.reacting_guild.id.str();
+          reaction.channel = channel_id;
+          reaction.user_id = user_id;
+          reaction.remote_id = event.message_id.str();
+          reaction.emoji = EmojiText(event.reacting_emoji);
+          reaction.add = false;
+
+          mailbox->Post([reaction](DiscordProtocol *protocol) {
+            protocol->core->RelayReaction(reaction);
+          });
+        });
+
+    this->cluster->on_typing_start(
+        [mailbox, filter](const dpp::typing_start_t &event) {
+          const std::string channel_id =
+              BridgedChannel(*filter, event.typing_channel.id);
+          const std::string user_id = event.user_id.str();
+          if (channel_id.empty() || user_id.empty() || filter->IsSelf(user_id))
+            return;
+
+          const Anope::string space = event.typing_guild.id.str();
+          const Anope::string channel = channel_id;
+          const Anope::string who = user_id;
+          mailbox->Post([space, channel, who](DiscordProtocol *protocol) {
+            protocol->core->RelayTyping(protocol->GetName(), space, channel,
+                                        who);
+          });
+        });
+
     /* A guild create carries the members Discord sends up front; DPP then
-     * asks for the rest of the roster, which arrives as member chunks. */
+     * asks for the rest of the roster, which arrives as member chunks. It
+     * also carries the guild's custom emoji, which are kept for
+     * resolving ":name:" reactions from IRC. */
     this->cluster->on_guild_create(
         [mailbox, filter](const dpp::guild_create_t &event) {
+          SnapshotEmoji(*filter, event.created.id, event.created.emojis);
           HandleRoster(filter, mailbox, event.created.id, event.created.members,
                        event.presences);
+        });
+
+    this->cluster->on_guild_emojis_update(
+        [filter](const dpp::guild_emojis_update_t &event) {
+          SnapshotEmoji(*filter, event.updating_guild.id, event.emojis);
         });
 
     this->cluster->on_guild_members_chunk(
@@ -1109,17 +1272,151 @@ public:
     bridge->endpoint_retry_at = 0;
   }
 
+  /** Renders the quote line which a reply from IRC carries.
+   *
+   * A webhook cannot set message_reference, so a reply is rendered as a
+   * Discord block quote of what it answers, with a jump link, followed
+   * by the text. The quote is elided when the msgid being replied to is
+   * not one of ours: the IRC client already showed the context.
+   *
+   * @param thread Receives the thread the quoted message lives in, so
+   *               that the reply can be posted into the same thread.
+   */
+  std::string RenderQuote(Bridge *bridge, const Anope::string &reply_to,
+                          dpp::snowflake &thread) {
+    const Anope::string remote_id = this->core->RemoteIdFor(reply_to);
+    if (remote_id.empty())
+      return "";
+
+    Anope::string author, excerpt, in_thread;
+    const bool known =
+        this->core->QuotedMessage(remote_id, author, excerpt, in_thread);
+    if (known && !in_thread.empty())
+      thread = dpp::snowflake(in_thread.c_str());
+
+    const std::string where =
+        thread ? in_thread.str() : bridge->foreign_channel.str();
+    /* U+2197 NORTH EAST ARROW, the conventional "jump to" glyph. */
+    const std::string link = "[\xe2\x86\x97](https://discord.com/channels/" +
+                             bridge->space.str() + "/" + where + "/" +
+                             remote_id.str() + ")";
+    if (!known)
+      return "> " + link + "\n";
+
+    /* The excerpt is IRC-rendered text: strip its formatting, and keep
+     * it on the one quote line. */
+    std::string plain = Anope::RemoveFormatting(excerpt).str();
+    std::replace(plain.begin(), plain.end(), '\n', ' ');
+    return "> **" + dpp::utility::markdown_escape(author.str()) +
+           "**: " + dpp::utility::markdown_escape(plain) + " " + link + "\n";
+  }
+
+  void Notice(Bridge *bridge, const Anope::string &text) override {
+    if (!this->cluster || !this->connected || text.empty())
+      return;
+
+    /* An event is about the channel rather than from anyone in it, so
+     * it comes from the bot account, not from a user's webhook, as one
+     * italic line. The whole text is literal and is escaped as such. */
+    std::string body = Text::TruncateCodePoints(
+        dpp::utility::markdown_escape(text.str(), true), 1998);
+    size_t slashes = 0;
+    while (slashes < body.length() && body[body.length() - 1 - slashes] == '\\')
+      ++slashes;
+    if (slashes % 2)
+      body.erase(body.length() - 1);
+    if (body.empty())
+      return;
+
+    dpp::message msg(dpp::snowflake(bridge->foreign_channel.c_str()),
+                     "*" + body + "*");
+    msg.set_allowed_mentions(false, false, false, false);
+    try {
+      this->cluster->message_create(msg);
+    } catch (const dpp::exception &err) {
+      Log(this->core->GetOwner()) << "BridgeServ: unable to relay an event to "
+                                  << bridge->irc_channel << ": " << err.what();
+    }
+  }
+
+  void React(Bridge *bridge, const Anope::string &remote_id,
+             const Anope::string &channel, const Anope::string &emoji,
+             bool add) override {
+    if (!this->cluster || !this->connected)
+      return;
+
+    /* ":name:" is one of the guild's custom emoji, which the API wants as
+     * "name:id". A name the guild does not have is dropped: sent as text
+     * it would be rejected, and it is not a unicode emoji either. */
+    std::string reaction = emoji.str();
+    if (reaction.length() > 2 && reaction.front() == ':' &&
+        reaction.back() == ':') {
+      const std::string name = reaction.substr(1, reaction.length() - 2);
+      const bool plain = std::all_of(name.begin(), name.end(), [](char chr) {
+        return std::isalnum(static_cast<unsigned char>(chr)) || chr == '_';
+      });
+      const std::string id =
+          plain ? this->filter->CustomEmoji(bridge->space.str(), name) : "";
+      if (id.empty()) {
+        Log(LOG_DEBUG) << "BridgeServ: no custom emoji named " << name
+                       << " in space " << bridge->space;
+        return;
+      }
+      reaction = name + ":" + id;
+    }
+
+    /* The reaction is the bot account's: Discord has no per-webhook
+     * reactions, so two IRC users reacting with the same emoji collapse
+     * into one, and an unreact from either removes it. */
+    try {
+      const dpp::snowflake message(remote_id.c_str());
+      const dpp::snowflake where(channel.c_str());
+      if (add)
+        this->cluster->message_add_reaction(message, where, reaction);
+      else
+        this->cluster->message_delete_own_reaction(message, where, reaction);
+    } catch (const dpp::exception &err) {
+      Log(this->core->GetOwner()) << "BridgeServ: unable to react in "
+                                  << bridge->irc_channel << ": " << err.what();
+    }
+  }
+
+  void Typing(Bridge *bridge) override {
+    if (!this->cluster || !this->connected)
+      return;
+
+    /* Discord has no per-webhook typing, so the indicator shows the bot
+     * account's name rather than the IRC nick; it is still the only way
+     * to show the channel that a reply is being written. */
+    try {
+      this->cluster->channel_typing(
+          dpp::snowflake(bridge->foreign_channel.c_str()));
+    } catch (const dpp::exception &err) {
+      Log(this->core->GetOwner()) << "BridgeServ: unable to show typing in "
+                                  << bridge->irc_channel << ": " << err.what();
+    }
+  }
+
   void Relay(Bridge *bridge, const BridgeOutbound &out) override {
     if (!this->cluster || !this->connected)
       return;
+
+    /* A reply to a message which lives in a thread is posted into that
+     * thread; everything else goes to the channel itself. */
+    dpp::snowflake thread_id = 0;
+    const std::string quote =
+        out.reply_to.empty() ? "" : this->RenderQuote(bridge, out.reply_to, thread_id);
 
     std::string text = Text::EscapeLineStart(
         dpp::utility::markdown_escape(out.text.str(), true));
 
     /* Discord rejects messages longer than 2000 characters. The body is
      * truncated before the italic markers are added so that an oversized
-     * action does not lose its closing marker. */
-    text = Text::TruncateCodePoints(text, out.action ? 1998 : 2000);
+     * action does not lose its closing marker, and the quote is never
+     * truncated, only the body which follows it. */
+    const size_t limit = out.action ? 1998 : 2000;
+    text = Text::TruncateCodePoints(
+        text, quote.length() < limit ? limit - quote.length() : 1);
 
     /* A trailing escape left behind by the truncation would escape the
      * closing marker of an action, or leak as a literal backslash. */
@@ -1136,14 +1433,38 @@ public:
       text = "*" + text + "*";
 
     const dpp::snowflake channel(bridge->foreign_channel.c_str());
-    dpp::message msg(channel, text);
+    dpp::message msg(channel, quote + text);
 
     /* Messages relayed from IRC never ping anybody; the wire payload gets
      * an empty allowed_mentions.parse list. */
     msg.set_allowed_mentions(false, false, false, false);
 
+    /* The link between the IRC line and what Discord made of it, filled
+     * in from the created message once it is known. A line without a
+     * msgid (an IRCd without the msgid capability) is not linked. */
+    Relay::Links::Entry link;
+    link.irc_msgid = out.msgid.str();
+    link.remote_thread = thread_id ? thread_id.str() : "";
+    link.author = out.nick.str();
+    link.excerpt = Text::TruncateCodePoints(out.text.str(), 120);
+    auto mailbox = this->mailbox;
+    const auto remember = [mailbox, link](const dpp::confirmation_callback_t &cb) {
+      if (link.irc_msgid.empty() || cb.is_error())
+        return;
+      Relay::Links::Entry entry = link;
+      try {
+        const auto &created = cb.get<dpp::message>();
+        entry.remote_id = created.id.str();
+        entry.remote_channel = created.channel_id.str();
+      } catch (const std::bad_variant_access &) {
+        return;
+      }
+      mailbox->Post([entry](DiscordProtocol *protocol) {
+        protocol->core->RememberLink(entry);
+      });
+    };
+
     if (!bridge->endpoint_id.empty()) {
-      auto mailbox = this->mailbox;
       const Anope::string key = bridge->irc_channel;
       try {
         dpp::webhook hook(dpp::snowflake(bridge->endpoint_id.c_str()),
@@ -1151,11 +1472,15 @@ public:
         hook.name =
             Text::WebhookName(out.nick.str(), this->webhook_suffix.str());
 
+        /* wait=true makes Discord answer with the created message, which
+         * is the only way to learn the id a webhook post was given. */
         this->cluster->execute_webhook(
-            hook, msg, false, 0, "",
-            [mailbox, key](const dpp::confirmation_callback_t &cb) {
-              if (!cb.is_error())
+            hook, msg, true, thread_id, "",
+            [mailbox, key, remember](const dpp::confirmation_callback_t &cb) {
+              if (!cb.is_error()) {
+                remember(cb);
                 return;
+              }
 
               const auto status = cb.http_info.status;
               const std::string error = cb.get_error().human_readable;
@@ -1173,12 +1498,13 @@ public:
 
     /* No usable webhook; fall back to the bot account and try to set a
      * webhook up for the next message. */
-    dpp::message fallback(channel,
-                          "<" + dpp::utility::markdown_escape(out.nick.str()) +
+    dpp::message fallback(thread_id ? thread_id : channel,
+                          quote + "<" +
+                              dpp::utility::markdown_escape(out.nick.str()) +
                               "> " + text);
     fallback.set_allowed_mentions(false, false, false, false);
     try {
-      this->cluster->message_create(fallback);
+      this->cluster->message_create(fallback, remember);
     } catch (const dpp::exception &err) {
       Log(this->core->GetOwner()) << "BridgeServ: unable to relay to "
                                   << bridge->irc_channel << ": " << err.what();
