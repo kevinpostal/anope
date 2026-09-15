@@ -369,6 +369,13 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
     return clean;
   }
 
+  /** The text of a reaction emoji as IRC sees it: a unicode emoji as-is,
+   * a guild's custom emoji as ":name:", the same shape RenderMessage
+   * gives one in a message. */
+  static std::string EmojiText(const dpp::emoji &emoji) {
+    return emoji.id ? ":" + emoji.name + ":" : emoji.name;
+  }
+
   /** Resolves the bridged channel a Discord channel maps to: itself, or
    * its parent when it is a thread of a bridged channel.
    * @return The bridged channel id, or an empty string if there is none.
@@ -565,10 +572,12 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
      * Discord sends no member list and the IRC channel can only ever show
      * the people who have spoken. GUILD_PRESENCES is only added when the
      * operator has enabled it, because an intent the application is not
-     * approved for is answered with gateway close 4014. */
-    uint32_t intents =
-        dpp::i_guilds | dpp::i_guild_messages | dpp::i_message_content |
-        dpp::i_guild_members;
+     * approved for is answered with gateway close 4014. Reactions and
+     * typing are not privileged and are always requested. */
+    uint32_t intents = dpp::i_guilds | dpp::i_guild_messages |
+                       dpp::i_message_content | dpp::i_guild_members |
+                       dpp::i_guild_message_reactions |
+                       dpp::i_guild_message_typing;
     if (this->use_presence)
       intents |= dpp::i_guild_presences;
 
@@ -639,6 +648,61 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
         protocol->core->RelayToIrc(relay);
       });
     });
+
+    /* Reactions are relayed from the reacting member's pseudo client.
+     * Clearing every reaction, or every reaction of one emoji, carries no
+     * per-user information to attribute an unreact to, so those two
+     * events are left alone. */
+    this->cluster->on_message_reaction_add(
+        [mailbox, filter](const dpp::message_reaction_add_t &event) {
+          const std::string channel_id =
+              BridgedChannel(*filter, event.channel_id);
+          const std::string user_id = event.reacting_user.id.str();
+          if (channel_id.empty() || user_id.empty() || filter->IsSelf(user_id))
+            return;
+
+          BridgeReaction reaction;
+          reaction.protocol = "discord";
+          reaction.space = event.reacting_guild.id.str();
+          reaction.channel = channel_id;
+          reaction.user_id = user_id;
+          reaction.remote_id = event.message_id.str();
+          reaction.emoji = EmojiText(event.reacting_emoji);
+          reaction.add = true;
+
+          std::string display = MemberDisplay(event.reacting_member);
+          if (display.empty())
+            display = event.reacting_user.global_name;
+          if (display.empty())
+            display = event.reacting_user.username;
+          reaction.display = display;
+
+          mailbox->Post([reaction](DiscordProtocol *protocol) {
+            protocol->core->RelayReaction(reaction);
+          });
+        });
+
+    this->cluster->on_message_reaction_remove(
+        [mailbox, filter](const dpp::message_reaction_remove_t &event) {
+          const std::string channel_id =
+              BridgedChannel(*filter, event.channel_id);
+          const std::string user_id = event.reacting_user_id.str();
+          if (channel_id.empty() || user_id.empty() || filter->IsSelf(user_id))
+            return;
+
+          BridgeReaction reaction;
+          reaction.protocol = "discord";
+          reaction.space = event.reacting_guild.id.str();
+          reaction.channel = channel_id;
+          reaction.user_id = user_id;
+          reaction.remote_id = event.message_id.str();
+          reaction.emoji = EmojiText(event.reacting_emoji);
+          reaction.add = false;
+
+          mailbox->Post([reaction](DiscordProtocol *protocol) {
+            protocol->core->RelayReaction(reaction);
+          });
+        });
 
     /* A guild create carries the members Discord sends up front; DPP then
      * asks for the rest of the roster, which arrives as member chunks. */

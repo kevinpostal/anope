@@ -67,6 +67,24 @@ struct BridgeOutbound final {
   Anope::string reply_to;
 };
 
+/** A reaction added to, or removed from, a message on a bridged network. */
+struct BridgeReaction final {
+  Anope::string protocol;
+  Anope::string space;
+  /* The bridged channel: the parent when the message is in a thread. */
+  Anope::string channel;
+  /* Who reacted. The display name is only known, and only needed, when a
+   * reaction is added: a removal from someone without a client is
+   * nothing to relay. */
+  Anope::string user_id;
+  Anope::string display;
+  /* The remote id of the message reacted to. */
+  Anope::string remote_id;
+  /* The emoji: a unicode sequence as-is, or ":name:" for a custom one. */
+  Anope::string emoji;
+  bool add = true;
+};
+
 /** One member of a bridged space, as the roster sees them.
  *
  * A bridge introduces an IRC pseudo client for every member of the space it
@@ -111,6 +129,10 @@ public:
 
   /** Relays a message from a bridged network into its IRC channel. */
   virtual void RelayToIrc(const BridgeMessage &msg) = 0;
+
+  /** Relays a reaction from a bridged network into its IRC channel, as a
+   * TAGMSG from the reacting member's pseudo client. */
+  virtual void RelayReaction(const BridgeReaction &reaction) = 0;
 
   /** Records that an IRC message was delivered to the remote network, so
    * that later replies and reactions can be mapped in both directions. */

@@ -180,6 +180,7 @@ class ModuleBridgeServ final : public Module, public BridgeCore {
   time_t flood_secs = 4;
   bool relay_edits = true;
   bool relay_deletes = false;
+  bool relay_reactions = true;
 
   std::vector<Bridge *> bridges;
 
@@ -941,6 +942,49 @@ public:
               wire.dropped));
   }
 
+  void RelayReaction(const BridgeReaction &reaction) override {
+    if (!IRCD || !this->relay_reactions)
+      return;
+
+    Bridge *bridge = this->FindRemote(reaction.protocol, reaction.channel);
+    if (!bridge || bridge->irc_channel.empty())
+      return;
+    if (!reaction.space.empty() && reaction.space != "0" &&
+        !bridge->space.equals_ci(reaction.space))
+      return;
+
+    /* Someone without a client is introduced for a reaction as they
+     * would be for a line; a removal from someone without one is nothing
+     * to relay. */
+    BridgeClient *client = this->FindClient(bridge, reaction.user_id);
+    if (!client && reaction.add && !reaction.display.empty())
+      client = this->EnsureClient(bridge, reaction.user_id, reaction.display);
+    if (!client || !client->user)
+      return;
+
+    client->last_active = Anope::CurTime;
+    this->EnsureJoin(client, bridge->irc_channel);
+
+    /* A reaction draws from the same bucket as a line: it is not allowed
+     * to storm the channel either. */
+    if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
+                     Anope::CurTime)) {
+      ++bridge->throttle.dropped;
+      return;
+    }
+
+    /* SendTagmsg is a no-op on an IRCd which did not advertise TAGMSG;
+     * the protocol module says so once the uplink has negotiated (see
+     * inspircd.cpp's ircv3_ctctags handling), which is the only point at
+     * which the answer is known, so nothing is checked here. */
+    Anope::map<Anope::string> tags;
+    tags["+draft/reply"] =
+        Relay::EscapeTagValue(this->IrcIdFor(reaction.remote_id).str());
+    tags[reaction.add ? "+draft/react" : "+draft/unreact"] =
+        Relay::EscapeTagValue(reaction.emoji.str());
+    IRCD->SendTagmsg(client->user, bridge->irc_channel, tags);
+  }
+
   void DeliverListing(const Anope::string &requester, const Anope::string &svc,
                       bool channels, bool failed,
                       const std::vector<Anope::string> &lines) override {
@@ -1183,6 +1227,7 @@ public:
         this->GetClamped<time_t>(block, "floodsecs", "4s", 1, 3600);
     this->relay_edits = block.Get<bool>("relayedits", "yes");
     this->relay_deletes = block.Get<bool>("relaydeletes", "no");
+    this->relay_reactions = block.Get<bool>("relayreactions", "yes");
 
     /* Zero disables reaping; anything else is at least a minute so the
      * reaper can not quit a client which just spoke. */
