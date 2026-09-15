@@ -36,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+namespace Relay = BridgeServ::Relay;
 namespace Text = BridgeServ::Text;
 
 class DiscordProtocol;
@@ -1109,17 +1110,65 @@ public:
     bridge->endpoint_retry_at = 0;
   }
 
+  /** Renders the quote line which a reply from IRC carries.
+   *
+   * A webhook cannot set message_reference, so a reply is rendered as a
+   * Discord block quote of what it answers, with a jump link, followed
+   * by the text. The quote is elided when the msgid being replied to is
+   * not one of ours: the IRC client already showed the context.
+   *
+   * @param thread Receives the thread the quoted message lives in, so
+   *               that the reply can be posted into the same thread.
+   */
+  std::string RenderQuote(Bridge *bridge, const Anope::string &reply_to,
+                          dpp::snowflake &thread) {
+    const Anope::string remote_id = this->core->RemoteIdFor(reply_to);
+    if (remote_id.empty())
+      return "";
+
+    Anope::string author, excerpt, in_thread;
+    const bool known =
+        this->core->QuotedMessage(remote_id, author, excerpt, in_thread);
+    if (known && !in_thread.empty())
+      thread = dpp::snowflake(in_thread.c_str());
+
+    const std::string where =
+        thread ? in_thread.str() : bridge->foreign_channel.str();
+    /* U+2197 NORTH EAST ARROW, the conventional "jump to" glyph. */
+    const std::string link = "[\xe2\x86\x97](https://discord.com/channels/" +
+                             bridge->space.str() + "/" + where + "/" +
+                             remote_id.str() + ")";
+    if (!known)
+      return "> " + link + "\n";
+
+    /* The excerpt is IRC-rendered text: strip its formatting, and keep
+     * it on the one quote line. */
+    std::string plain = Anope::RemoveFormatting(excerpt).str();
+    std::replace(plain.begin(), plain.end(), '\n', ' ');
+    return "> **" + dpp::utility::markdown_escape(author.str()) +
+           "**: " + dpp::utility::markdown_escape(plain) + " " + link + "\n";
+  }
+
   void Relay(Bridge *bridge, const BridgeOutbound &out) override {
     if (!this->cluster || !this->connected)
       return;
+
+    /* A reply to a message which lives in a thread is posted into that
+     * thread; everything else goes to the channel itself. */
+    dpp::snowflake thread_id = 0;
+    const std::string quote =
+        out.reply_to.empty() ? "" : this->RenderQuote(bridge, out.reply_to, thread_id);
 
     std::string text = Text::EscapeLineStart(
         dpp::utility::markdown_escape(out.text.str(), true));
 
     /* Discord rejects messages longer than 2000 characters. The body is
      * truncated before the italic markers are added so that an oversized
-     * action does not lose its closing marker. */
-    text = Text::TruncateCodePoints(text, out.action ? 1998 : 2000);
+     * action does not lose its closing marker, and the quote is never
+     * truncated, only the body which follows it. */
+    const size_t limit = out.action ? 1998 : 2000;
+    text = Text::TruncateCodePoints(
+        text, quote.length() < limit ? limit - quote.length() : 1);
 
     /* A trailing escape left behind by the truncation would escape the
      * closing marker of an action, or leak as a literal backslash. */
@@ -1136,14 +1185,38 @@ public:
       text = "*" + text + "*";
 
     const dpp::snowflake channel(bridge->foreign_channel.c_str());
-    dpp::message msg(channel, text);
+    dpp::message msg(channel, quote + text);
 
     /* Messages relayed from IRC never ping anybody; the wire payload gets
      * an empty allowed_mentions.parse list. */
     msg.set_allowed_mentions(false, false, false, false);
 
+    /* The link between the IRC line and what Discord made of it, filled
+     * in from the created message once it is known. A line without a
+     * msgid (an IRCd without the msgid capability) is not linked. */
+    Relay::Links::Entry link;
+    link.irc_msgid = out.msgid.str();
+    link.remote_thread = thread_id ? thread_id.str() : "";
+    link.author = out.nick.str();
+    link.excerpt = Text::TruncateCodePoints(out.text.str(), 120);
+    auto mailbox = this->mailbox;
+    const auto remember = [mailbox, link](const dpp::confirmation_callback_t &cb) {
+      if (link.irc_msgid.empty() || cb.is_error())
+        return;
+      Relay::Links::Entry entry = link;
+      try {
+        const auto &created = cb.get<dpp::message>();
+        entry.remote_id = created.id.str();
+        entry.remote_channel = created.channel_id.str();
+      } catch (const std::bad_variant_access &) {
+        return;
+      }
+      mailbox->Post([entry](DiscordProtocol *protocol) {
+        protocol->core->RememberLink(entry);
+      });
+    };
+
     if (!bridge->endpoint_id.empty()) {
-      auto mailbox = this->mailbox;
       const Anope::string key = bridge->irc_channel;
       try {
         dpp::webhook hook(dpp::snowflake(bridge->endpoint_id.c_str()),
@@ -1151,11 +1224,15 @@ public:
         hook.name =
             Text::WebhookName(out.nick.str(), this->webhook_suffix.str());
 
+        /* wait=true makes Discord answer with the created message, which
+         * is the only way to learn the id a webhook post was given. */
         this->cluster->execute_webhook(
-            hook, msg, false, 0, "",
-            [mailbox, key](const dpp::confirmation_callback_t &cb) {
-              if (!cb.is_error())
+            hook, msg, true, thread_id, "",
+            [mailbox, key, remember](const dpp::confirmation_callback_t &cb) {
+              if (!cb.is_error()) {
+                remember(cb);
                 return;
+              }
 
               const auto status = cb.http_info.status;
               const std::string error = cb.get_error().human_readable;
@@ -1173,12 +1250,13 @@ public:
 
     /* No usable webhook; fall back to the bot account and try to set a
      * webhook up for the next message. */
-    dpp::message fallback(channel,
-                          "<" + dpp::utility::markdown_escape(out.nick.str()) +
+    dpp::message fallback(thread_id ? thread_id : channel,
+                          quote + "<" +
+                              dpp::utility::markdown_escape(out.nick.str()) +
                               "> " + text);
     fallback.set_allowed_mentions(false, false, false, false);
     try {
-      this->cluster->message_create(fallback);
+      this->cluster->message_create(fallback, remember);
     } catch (const dpp::exception &err) {
       Log(this->core->GetOwner()) << "BridgeServ: unable to relay to "
                                   << bridge->irc_channel << ": " << err.what();
