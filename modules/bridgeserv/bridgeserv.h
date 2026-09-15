@@ -244,6 +244,21 @@ public:
    * Networks with no such notion leave this alone. */
   virtual void Typing(Bridge *bridge) { (void)bridge; }
 
+  /** Adds or removes a reaction on a remote message on behalf of IRC.
+   * @param remote_id The remote message.
+   * @param channel The remote channel or thread the message lives in.
+   * @param emoji A unicode emoji as-is, or ":name:" for a custom one.
+   */
+  virtual void React(Bridge *bridge, const Anope::string &remote_id,
+                     const Anope::string &channel, const Anope::string &emoji,
+                     bool add) {
+    (void)bridge;
+    (void)remote_id;
+    (void)channel;
+    (void)emoji;
+    (void)add;
+  }
+
   /** Called when the set of bridges has changed in any way. */
   virtual void OnBridgesChanged() {}
 

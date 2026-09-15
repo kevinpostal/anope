@@ -100,6 +100,12 @@ class DiscordFilter final {
   /* The presence Discord last reported per user id. */
   std::unordered_map<std::string, dpp::presence_status> presences;
 
+  /* The custom emoji of each guild, name -> id, snapshotted from the
+   * gateway so that the main thread can resolve ":name:" without reading
+   * DPP's cache from the wrong thread. */
+  std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+      custom_emoji;
+
 public:
   bool IsBridged(const std::string &channel_id) {
     std::lock_guard<std::mutex> lock(this->mutex);
@@ -185,6 +191,24 @@ public:
 
     status = it->second;
     return true;
+  }
+
+  /** Replaces the custom emoji known for a guild. */
+  void SetCustomEmoji(const std::string &guild_id,
+                      std::unordered_map<std::string, std::string> by_name) {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    this->custom_emoji[guild_id] = std::move(by_name);
+  }
+
+  /** The id of a guild's custom emoji, or "" if it has none of that name. */
+  std::string CustomEmoji(const std::string &guild_id,
+                          const std::string &name) {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    const auto guild = this->custom_emoji.find(guild_id);
+    if (guild == this->custom_emoji.end())
+      return "";
+    const auto it = guild->second.find(name);
+    return it == guild->second.end() ? "" : it->second;
   }
 };
 
@@ -374,6 +398,17 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
    * gives one in a message. */
   static std::string EmojiText(const dpp::emoji &emoji) {
     return emoji.id ? ":" + emoji.name + ":" : emoji.name;
+  }
+
+  /** Records the custom emoji of a guild, by name, from DPP's cache. */
+  static void SnapshotEmoji(DiscordFilter &filter, dpp::snowflake guild_id,
+                            const std::vector<dpp::snowflake> &ids) {
+    std::unordered_map<std::string, std::string> by_name;
+    for (const auto id : ids) {
+      if (const auto *emoji = dpp::find_emoji(id))
+        by_name[emoji->name] = id.str();
+    }
+    filter.SetCustomEmoji(guild_id.str(), std::move(by_name));
   }
 
   /** Resolves the bridged channel a Discord channel maps to: itself, or
@@ -722,11 +757,19 @@ class DiscordProtocol final : public BridgeProtocol, public Pipe {
         });
 
     /* A guild create carries the members Discord sends up front; DPP then
-     * asks for the rest of the roster, which arrives as member chunks. */
+     * asks for the rest of the roster, which arrives as member chunks. It
+     * also carries the guild's custom emoji, which are kept for
+     * resolving ":name:" reactions from IRC. */
     this->cluster->on_guild_create(
         [mailbox, filter](const dpp::guild_create_t &event) {
+          SnapshotEmoji(*filter, event.created.id, event.created.emojis);
           HandleRoster(filter, mailbox, event.created.id, event.created.members,
                        event.presences);
+        });
+
+    this->cluster->on_guild_emojis_update(
+        [filter](const dpp::guild_emojis_update_t &event) {
+          SnapshotEmoji(*filter, event.updating_guild.id, event.emojis);
         });
 
     this->cluster->on_guild_members_chunk(
@@ -1266,6 +1309,48 @@ public:
     std::replace(plain.begin(), plain.end(), '\n', ' ');
     return "> **" + dpp::utility::markdown_escape(author.str()) +
            "**: " + dpp::utility::markdown_escape(plain) + " " + link + "\n";
+  }
+
+  void React(Bridge *bridge, const Anope::string &remote_id,
+             const Anope::string &channel, const Anope::string &emoji,
+             bool add) override {
+    if (!this->cluster || !this->connected)
+      return;
+
+    /* ":name:" is one of the guild's custom emoji, which the API wants as
+     * "name:id". A name the guild does not have is dropped: sent as text
+     * it would be rejected, and it is not a unicode emoji either. */
+    std::string reaction = emoji.str();
+    if (reaction.length() > 2 && reaction.front() == ':' &&
+        reaction.back() == ':') {
+      const std::string name = reaction.substr(1, reaction.length() - 2);
+      const bool plain = std::all_of(name.begin(), name.end(), [](char chr) {
+        return std::isalnum(static_cast<unsigned char>(chr)) || chr == '_';
+      });
+      const std::string id =
+          plain ? this->filter->CustomEmoji(bridge->space.str(), name) : "";
+      if (id.empty()) {
+        Log(LOG_DEBUG) << "BridgeServ: no custom emoji named " << name
+                       << " in space " << bridge->space;
+        return;
+      }
+      reaction = name + ":" + id;
+    }
+
+    /* The reaction is the bot account's: Discord has no per-webhook
+     * reactions, so two IRC users reacting with the same emoji collapse
+     * into one, and an unreact from either removes it. */
+    try {
+      const dpp::snowflake message(remote_id.c_str());
+      const dpp::snowflake where(channel.c_str());
+      if (add)
+        this->cluster->message_add_reaction(message, where, reaction);
+      else
+        this->cluster->message_delete_own_reaction(message, where, reaction);
+    } catch (const dpp::exception &err) {
+      Log(this->core->GetOwner()) << "BridgeServ: unable to react in "
+                                  << bridge->irc_channel << ": " << err.what();
+    }
   }
 
   void Typing(Bridge *bridge) override {

@@ -1433,6 +1433,34 @@ public:
       protocol->Typing(bridge);
     }
 
+    /* A reaction names the message it is on with +draft/reply; one on a
+     * message which did not cross the bridge, or which is no longer
+     * remembered, has nowhere to go. */
+    const auto react = tags.find("+draft/react");
+    const auto unreact = tags.find("+draft/unreact");
+    const auto reply = tags.find("+draft/reply");
+    const bool add = react != tags.end();
+    if (this->relay_reactions && reply != tags.end() &&
+        (add || unreact != tags.end())) {
+      const Anope::string emoji =
+          Relay::UnescapeTagValue((add ? react : unreact)->second.str());
+      const Anope::string remote_id =
+          this->RemoteIdFor(Relay::UnescapeTagValue(reply->second.str()));
+      if (!emoji.empty() && !remote_id.empty()) {
+        /* Reactions draw from the bridge's bucket like lines do. */
+        if (!Relay::Take(bridge->throttle, this->flood_lines, this->flood_secs,
+                         Anope::CurTime)) {
+          ++bridge->throttle.dropped;
+        } else {
+          Anope::string author, excerpt, thread;
+          this->QuotedMessage(remote_id, author, excerpt, thread);
+          protocol->React(bridge, remote_id,
+                          thread.empty() ? bridge->foreign_channel : thread,
+                          emoji, add);
+        }
+      }
+    }
+
     return EVENT_CONTINUE;
   }
 };
